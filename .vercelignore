@@ -1,0 +1,9 @@
+data/
+.env
+.env.*
+!.env.example
+node_modules/
+*.log
+app.v1.backup.js
+tests/
+DEPLOYMENT.md

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#235a47">
+  <title>Sign in · Gather CRM</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/auth.js" defer></script>
+</head>
+<body class="auth-page">
+  <main class="auth-layout">
+    <section class="auth-story" aria-label="Gather CRM">
+      <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span>Gather<span class="brand-label">CRM</span></a>
+      <div class="auth-story-content">
+        <div class="eyebrow">A little card. A new connection.</div>
+        <h1>Good connections<br>deserve a follow-up.</h1>
+        <p>Your business cards, contacts, and conversations.<br>One thoughtful place to bring them together.</p>
+        <div class="auth-illustration" aria-hidden="true">
+          <div class="auth-mini-card"><span class="auth-card-symbol">↗</span><div><strong>Your next connection</strong><span>Captured. Organised. Remembered.</span></div></div>
+          <div class="auth-flow"><span>Capture</span><b>→</b><span>Connect</span><b>→</b><span>Keep in touch</span></div>
+        </div>
+      </div>
+      <p class="auth-story-footer">Made for the people behind the business.</p>
+    </section>
+    <section class="auth-panel" aria-labelledby="auth-title">
+      <div class="auth-card">
+        <div class="auth-lock" aria-hidden="true">↗</div>
+        <div class="eyebrow" id="auth-eyebrow">YOUR PRIVATE WORKSPACE</div>
+        <h2 id="auth-title">Welcome to Gather</h2>
+        <p id="auth-description" class="muted" role="status">Checking your account…</p>
+        <div class="auth-modes" role="group" aria-label="Account access" hidden>
+          <button type="button" id="mode-login" aria-pressed="true">Sign in</button>
+          <button type="button" id="mode-signup" aria-pressed="false">Create account</button>
+        </div>
+        <div id="auth-google-section" hidden>
+          <button type="button" id="google-login" class="button secondary auth-google">
+            <svg aria-hidden="true" width="20" height="20" viewBox="0 0 48 48"><path fill="#4285F4" d="M43.6 24.5c0-1.4-.1-2.8-.4-4.1H24v7.8h11a9.4 9.4 0 0 1-4.1 6.2v5.2h6.7c3.9-3.6 6-8.8 6-15.1Z"/><path fill="#34A853" d="M24 44c5.5 0 10.1-1.8 13.5-4.9l-6.7-5.2c-1.8 1.2-4.1 1.9-6.8 1.9-5.3 0-9.8-3.6-11.4-8.4H5.7v5.4A20.4 20.4 0 0 0 24 44Z"/><path fill="#FBBC05" d="M12.6 27.4a12.2 12.2 0 0 1 0-7.8v-5.4H5.7a20.4 20.4 0 0 0 0 18.6l6.9-5.4Z"/><path fill="#EA4335" d="M24 11.3c3 0 5.7 1 7.8 3.1l5.9-5.9A19.8 19.8 0 0 0 24 3a20.4 20.4 0 0 0-18.3 11.2l6.9 5.4C14.2 14.8 18.7 11.3 24 11.3Z"/></svg>
+            Continue with Google
+          </button>
+          <small id="google-setup-note" hidden>Google sign-in needs one-time setup by the app administrator.</small>
+          <div class="auth-divider"><span>or continue with email</span></div>
+        </div>
+        <p id="registration-closed" class="notice" hidden>This installation already has an owner account. Sign in to access it.</p>
+        <p id="auth-error" class="inline-error" role="alert" hidden></p>
+        <form id="auth-form" hidden>
+          <label class="field" id="auth-name-field" hidden><span>Your name</span><input name="name" autocomplete="name" maxlength="100" placeholder="Your full name"></label>
+          <label class="field"><span>Email address</span><input name="email" type="email" autocomplete="username" required maxlength="254" placeholder="you@business.com" spellcheck="false" autocapitalize="none"></label>
+          <label class="field"><span id="password-label">Password</span><span class="auth-password"><input id="auth-password" aria-labelledby="password-label" aria-describedby="password-help" name="password" type="password" autocomplete="current-password" required maxlength="1024" placeholder="Enter your password"><button id="toggle-password" type="button" aria-label="Show password" aria-controls="auth-password" aria-pressed="false">Show</button></span><small id="password-help" hidden>Use at least 12 characters. A few memorable words work well.</small></label>
+          <label class="field" id="auth-confirm-field" hidden><span>Confirm password</span><input name="confirmPassword" type="password" autocomplete="new-password" maxlength="1024" placeholder="Enter your password again"></label>
+          <button id="auth-submit" class="button primary auth-submit" type="submit">Sign in →</button>
+        </form>
+        <button id="auth-retry" class="button secondary" type="button" hidden>Try again</button>
+        <p class="auth-footnote" id="auth-footnote">Your contacts and outreach are available after you sign in.</p>
+        <nav class="auth-policy-links" aria-label="About and policies"><a href="/about">About Gather</a><a href="/privacy">Privacy policy</a><a href="/terms">Terms</a></nav>
+        <noscript><p class="inline-error">Enable JavaScript to sign in to Gather.</p></noscript>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,10 @@
+data/
+.env
+.env.*
+!.env.example
+.vercel/
+node_modules/
+*.log
+.vercel
+.env*
+!.env.example
