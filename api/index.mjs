@@ -29,6 +29,7 @@ export default async function handler(req,res) {
     writeFileSync(join(dataDir,'.secret-key'),storageKey(),{mode:0o600});
     const app=createGather({dataDir,env:{...process.env,GATHER_HOSTED:'1'},
       onPersist:name=>store.write(name,readFileSync(join(dataDir,name))),
+      onDelete:name=>store.remove(name),
       loadAccount:async(prefix,directory)=>{const bytes=await store.read(prefix+'gather.json');if(bytes)writeFileSync(join(directory,'gather.json'),bytes,{mode:0o600});},
       getAsset:async name=>await store.read(name)||Promise.reject(Object.assign(Error('Image not found.'),{status:404})),
     });

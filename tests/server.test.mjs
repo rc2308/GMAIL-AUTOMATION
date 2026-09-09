@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,readFileSync} from 'node:fs';
+import {mkdtempSync,readFileSync,writeFileSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createGather} from '../server.mjs';
@@ -9,10 +9,10 @@ const pixel='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwM
 const image={name:'test-card.png',mime:'image/png',data:pixel};
 async function setup(t,options={}) {
   const dataDir=mkdtempSync(join(tmpdir(),'gather-test-'));
-  const app=createGather({dataDir,...options});
+  let app=createGather({dataDir,...options});
   await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
   t.after(()=>new Promise(resolve=>{app.server.closeAllConnections();app.server.close(resolve);}));
-  const base=`http://127.0.0.1:${app.server.address().port}`;
+  let base=`http://127.0.0.1:${app.server.address().port}`;
   if(options.env?.GATHER_HOSTED==='1')options.env.GATHER_PUBLIC_ORIGIN=base.replace('http:','https:');
   let sessionCookie='';
   const request=async(path,body,extra={})=>{
@@ -22,11 +22,16 @@ async function setup(t,options={}) {
   };
   const owner=await request('/api/auth/setup',{name:'Test Owner',email:'owner@example.com',password:'test-only-passphrase'});
   assert.equal(owner.status,201);sessionCookie=owner.headers.get('set-cookie').split(';')[0];
-  return {...app,dataDir,base,request};
+  return {...app,dataDir,base,request,async restart(){
+    app.server.closeAllConnections();await new Promise(resolve=>app.server.close(resolve));
+    app=createGather({dataDir,...options});await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
+    base=`http://127.0.0.1:${app.server.address().port}`;
+    if(options.env?.GATHER_HOSTED==='1')options.env.GATHER_PUBLIC_ORIGIN=base.replace('http:','https:');
+  }};
 }
 const json=(value,status=200)=>new Response(JSON.stringify(value),{status,headers:{'content-type':'application/json'}});
 function upstreamMock(){
-  let counter=0,scope='',sends=[],failure=false;const sheets=new Map();
+  let counter=0,scope='',sends=[],failure=false;const sheets=new Map(),sourceTabs=new Map();
   const fetchImpl=async(url,init={})=>{
     if(url==='https://oauth2.googleapis.com/token') {
       const form=new URLSearchParams(init.body);scope=form.get('code');
@@ -37,13 +42,18 @@ function upstreamMock(){
       const id='spreadsheet-'+(++counter);sheets.set(id,[]);return json({spreadsheetId:id,properties:{title:JSON.parse(init.body).properties.title},sheets:[{properties:{title:'Gather Contacts'}}]});
     }
     if(url.includes('sheets.googleapis.com')){
-      const id=url.split('/spreadsheets/')[1].split('/')[0],rows=sheets.get(id)||[];
+      const path=new URL(url).pathname,id=path.split('/spreadsheets/')[1].split('/')[0].split(':')[0],rows=sheets.get(id)||[];
       if(url.includes('values:batchUpdate')) {
         for(const item of JSON.parse(init.body).data){const index=Number(item.range.match(/!A(\d+)/)[1])-1;item.values.forEach((row,i)=>{rows[index+i] ||= [];row.forEach((value,column)=>{rows[index+i][column]=value;});});}sheets.set(id,rows);return json({});
       }
       if(url.includes(':append')){rows.push(...JSON.parse(init.body).values);sheets.set(id,rows);return json({});}
-      if(url.includes('/values/'))return json({values:rows});
-      return json({spreadsheetId:id,properties:{title:'Existing'},sheets:[{properties:{title:'Gather Contacts'}}]});
+      if(url.includes('/values/')){
+        const tab=decodeURIComponent(path.split('/values/')[1]).match(/^'(.*)'!/)?.[1].replaceAll("''","'");
+        if(tab!=='Gather Contacts')return sourceTabs.get(id)?.has(tab)?json({values:sourceTabs.get(id).get(tab)}):json({error:{message:'Source tab not found'}},400);
+        return json({values:rows});
+      }
+      if(url.includes(':batchUpdate')){assert.deepEqual(JSON.parse(init.body),{requests:[{addSheet:{properties:{title:'Gather Contacts'}}}]});sheets.set(id,[]);return json({});}
+      return json({spreadsheetId:id,properties:{title:'Existing'},sheets:[...sourceTabs.get(id)?.keys()||[],...(sheets.has(id)?['Gather Contacts']:[])].map(title=>({properties:{title}}))});
     }
     if(url==='https://gmail.googleapis.com/gmail/v1/users/me/messages/send') {
       sends.push(Buffer.from(JSON.parse(init.body).raw,'base64url').toString());
@@ -53,13 +63,73 @@ function upstreamMock(){
     if(url.includes('generativelanguage.googleapis.com'))return json({candidates:[{content:{parts:[{text:JSON.stringify({name:'Person',business:'Example business',role:'Director',emails:['one@example.com','two@example.com'],phones:['+91 9000012345','+91 9000054321']})}]}}]});
     throw Error('Unexpected upstream URL: '+url);
   };
-  return {fetchImpl,sheets,sends,setFailure:()=>failure=true};
+  return {fetchImpl,sheets,sourceTabs,sends,setFailure:()=>failure=true};
 }
 async function connect(request,kind){
   const start=await request('/api/connect/google',{kind});assert.equal(start.status,200);
   const state=new URL(start.body.url).searchParams.get('state');const cookie=start.headers.get('set-cookie').split(';')[0];
   const callback=await request(`/api/oauth/google/callback?state=${state}&code=${kind}`,undefined,{headers:{cookie}});assert.equal(callback.status,303);
 }
+
+test('linking an existing spreadsheet imports mapped contacts into its workspace without changing the source tab',async t=>{
+  const mock=upstreamMock(),sheetId='existing-contacts-123';
+  const original=[['Full name','Company','Work emails','Mobile','Notes'],['Alice','Acme','alice@example.com; sales@example.com','+91 9000012345','Source note'],['Bob','Beta','','+91 9000098765',''],['No details','','','','']];
+  mock.sourceTabs.set(sheetId,new Map([["Team's contacts",structuredClone(original)]]));
+  const {request,dataDir}=await setup(t,{fetchImpl:mock.fetchImpl,env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret'}});
+  await connect(request,'sheets');
+  const other=(await request('/api/workspaces',{name:'Other workspace'})).body;
+  const target=(await request('/api/workspaces',{name:'Existing contacts'})).body;
+  const local=(await request('/api/contacts',{workspace:target.id,name:'Local',emails:['local@example.com']})).body;
+  const linked=await request(`/api/workspaces/${target.id}/sheet`,{mode:'existing',sheetId:`  https://docs.google.com/spreadsheets/d/${sheetId}/edit?usp=sharing#gid=42  `});
+  assert.equal(linked.status,200);assert.equal(linked.body.sheetId,sheetId);assert.equal(linked.body.sheetEmail,'sender@example.com');
+  assert.equal(mock.sheets.get(sheetId)[1][0],local.id);
+  const imported=await request(`/api/workspaces/${target.id}/import-sheet`,{tab:"Team's contacts",columns:{name:' Full name ',business:'Company',emails:'work emails',phones:'Mobile',notes:''}});
+  assert.equal(imported.status,200);assert.equal(imported.body.count,2);
+  let state=(await request('/api/state')).body;
+  assert.equal(state.contacts.length,1);assert.equal(state.uploads.length,2);
+  assert.ok(state.uploads.every(upload=>upload.workspace===target.id&&upload.status==='review'));
+  assert.deepEqual(state.uploads[0].fields.emails,['alice@example.com','sales@example.com']);
+  assert.equal(state.uploads[0].fields.notes,'');assert.deepEqual(state.uploads[1].fields.phones,['+91 9000098765']);
+  const approved=await request(`/api/uploads/${state.uploads[0].id}/review`,{action:'save',contact:state.uploads[0].fields});
+  assert.equal(approved.status,200);assert.equal(mock.sheets.get(sheetId).length,3);
+  assert.deepEqual(mock.sourceTabs.get(sheetId).get("Team's contacts"),original);
+  assert.equal((await request(`/api/workspaces/${other.id}/sheet`,{mode:'existing',sheetId})).status,400);
+  const restarted=createGather({dataDir});state=restarted.publicState();restarted.server.close();
+  assert.equal(state.workspaces.find(w=>w.id===target.id).sheetId,sheetId);assert.equal(state.workspaces.find(w=>w.id===other.id).sheetId,null);
+  assert.equal(state.contacts.filter(c=>c.workspace===other.id).length,0);
+});
+
+test('bad sheet links and denied Google access leave the workspace available for a corrected link',async t=>{
+  const mock=upstreamMock();let denied=true;
+  const {request}=await setup(t,{fetchImpl:(url,init)=>url.includes('sheets.googleapis.com')&&denied?json({error:{message:'No permission to access this spreadsheet'}},403):mock.fetchImpl(url,init),env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret'}});
+  await connect(request,'sheets');const ws=(await request('/api/workspaces',{name:'Retry link'})).body;
+  for(const sheetId of ['', 'short', 'https://example.com/spreadsheets/d/valid-looking-id/edit']){
+    const invalid=await request(`/api/workspaces/${ws.id}/sheet`,{mode:'existing',sheetId});assert.equal(invalid.status,400);assert.match(invalid.body.error,/valid Google spreadsheet/);
+  }
+  const failed=await request(`/api/workspaces/${ws.id}/sheet`,{mode:'existing',sheetId:'existing-contacts-456'});assert.ok(failed.status>=400);
+  assert.equal((await request('/api/state')).body.workspaces[0].sheetId,null);
+  denied=false;
+  assert.equal((await request(`/api/workspaces/${ws.id}/sheet`,{mode:'existing',sheetId:'  existing-contacts-456  '})).status,200);
+  assert.equal((await request('/api/state')).body.workspaces.length,1);
+});
+
+test('invalid imported rows fail together, and correcting the source allows a clean retry',async t=>{
+  const mock=upstreamMock(),sheetId='existing-invalid-123';
+  mock.sourceTabs.set(sheetId,new Map([['Contacts',[['Name','Email'],['Good','good@example.com'],['Bad','not-an-email']]]]));
+  const {request,dataDir}=await setup(t,{fetchImpl:mock.fetchImpl,env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret'}});
+  await connect(request,'sheets');const ws=(await request('/api/workspaces',{name:'Import retry'})).body;
+  await request(`/api/workspaces/${ws.id}/sheet`,{mode:'existing',sheetId});
+  const input={tab:'Contacts',columns:{name:'Name',emails:'Email',phones:''}};
+  const invalid=await request(`/api/workspaces/${ws.id}/import-sheet`,input);assert.equal(invalid.status,400);assert.match(invalid.body.error,/Row 3:.*No rows were imported/);
+  assert.equal((await request('/api/state')).body.uploads.length,0);assert.equal(JSON.parse(readFileSync(join(dataDir,'gather.json'),'utf8')).uploads.length,0);
+  assert.equal((await request(`/api/workspaces/${ws.id}/import-sheet`,{...input,columns:{emails:'',phones:''}})).status,400);
+  assert.ok((await request(`/api/workspaces/${ws.id}/import-sheet`,{...input,tab:'Missing'})).status>=400);
+  mock.sourceTabs.get(sheetId).get('Contacts')[2][1]='fixed@example.com';
+  const retried=await request(`/api/workspaces/${ws.id}/import-sheet`,input);assert.equal(retried.status,200);assert.equal(retried.body.count,2);
+  assert.equal((await request('/api/state')).body.uploads.length,2);
+  await request('/api/disconnect',{kind:'sheets'});
+  assert.equal((await request(`/api/workspaces/${ws.id}/import-sheet`,input)).status,409);
+});
 
 test('separate workspaces, templates and copied contacts persist across restart',async t=>{
   const {request,dataDir,server}=await setup(t);
@@ -193,6 +263,105 @@ test('model discovery reports credential errors, empty catalogs and repeated pag
   mode='loop';result=await request('/api/settings/models',{provider:'gemini',apiKey:'test-key'});assert.equal(result.status,502);assert.match(result.body.error,/repeated/);
 });
 
+test('Anthropic model discovery loads every page, respects vision capabilities, and never saves a typed key',async t=>{
+  const calls=[];
+  const {request,dataDir}=await setup(t,{fetchImpl:async(url,init)=>{
+    calls.push({url,init});const endpoint=new URL(url);
+    assert.equal(endpoint.origin,'https://api.anthropic.com');assert.equal(endpoint.pathname,'/v1/models');
+    assert.equal(endpoint.searchParams.get('limit'),'1000');assert.equal(endpoint.searchParams.has('after'),false);
+    return json(endpoint.searchParams.get('after_id')?{data:[{id:'claude-test-sonnet',display_name:'Claude Test Sonnet'},{id:'claude-test-opus',display_name:'Claude Test Opus',capabilities:{image_input:{supported:true}}}],has_more:false}
+      :{data:[{id:'claude-test-sonnet',display_name:'Claude Test Sonnet'},{id:'text-only',display_name:'Text Only',capabilities:{image_input:{supported:false}}}],has_more:true,last_id:'text-only'});
+  }});
+  assert.equal((await request('/api/settings/models',{provider:'anthropic'})).status,409);assert.equal(calls.length,0);
+  const result=await request('/api/settings/models',{provider:'anthropic',apiKey:' typed-anthropic-key ',baseUrl:'https://unrelated.example/v1'});
+  assert.equal(result.status,200);assert.equal(result.body.models.length,3);assert.equal(calls.length,2);
+  assert.equal(new URL(calls[1].url).searchParams.get('after_id'),'text-only');
+  assert.deepEqual(result.body.models.find(m=>m.id==='claude-test-opus'),{id:'claude-test-opus',name:'Claude Test Opus',description:'',selectable:true});
+  assert.equal(result.body.models.find(m=>m.id==='text-only').selectable,false);
+  assert.ok(calls.every(c=>c.init.headers['x-api-key']==='typed-anthropic-key'&&c.init.headers['anthropic-version']==='2023-06-01'&&!c.init.headers.authorization&&!c.url.includes('typed-anthropic-key')&&c.init.redirect==='error'));
+  assert.ok(!readFileSync(join(dataDir,'gather.json'),'utf8').includes('typed-anthropic-key'));
+  assert.equal((await request('/api/state')).body.settings.hasKey,false);
+});
+
+test('Anthropic settings encrypt the key, retain model choices, and isolate credentials between providers',async t=>{
+  const calls=[];
+  const {request,dataDir}=await setup(t,{fetchImpl:async(url,init)=>{
+    calls.push({url,init});return json(new URL(url).pathname==='/v1/models'?{data:[{id:'claude-test',display_name:'Claude Test'}],has_more:false}:{content:[{type:'text',text:'{"ok":true}'}],stop_reason:'end_turn'});
+  }});
+  assert.equal((await request('/api/settings',{provider:'anthropic',enabled:true,model:'claude-test',apiKey:' saved-anthropic-key '})).status,200);
+  let state=(await request('/api/state')).body;
+  assert.equal(state.settings.provider,'anthropic');assert.equal(state.settings.model,'claude-test');assert.equal(state.settings.hasKey,true);assert.equal(state.settings.secret,undefined);
+  assert.ok(!JSON.stringify(state).includes('saved-anthropic-key'));assert.ok(!readFileSync(join(dataDir,'gather.json'),'utf8').includes('saved-anthropic-key'));
+  assert.equal((await request('/api/settings/models',{provider:'anthropic',baseUrl:'https://ignored.example/v1'})).status,200);
+  assert.equal(calls[0].init.headers['x-api-key'],'saved-anthropic-key');
+  assert.equal((await request('/api/settings/models',{provider:'anthropic',clearKey:true})).status,409);
+  assert.equal((await request('/api/settings/models',{provider:'gemini'})).status,409);
+  assert.equal(calls.length,1);
+  await request('/api/settings/models',{provider:'compatible',baseUrl:'https://other.example/v1'});
+  assert.equal(calls[1].init.headers.authorization,undefined);assert.equal(calls[1].init.headers['x-api-key'],undefined);
+  await request('/api/settings',{provider:'anthropic',enabled:true,model:'claude-another-choice'});
+  assert.equal((await request('/api/settings/test',{})).status,200);
+  const call=calls.at(-1),payload=JSON.parse(call.init.body);
+  assert.equal(call.url,'https://api.anthropic.com/v1/messages');assert.equal(call.init.headers['x-api-key'],'saved-anthropic-key');
+  assert.equal(payload.model,'claude-another-choice');assert.equal(payload.messages[0].content.length,1);assert.equal(payload.messages[0].content[0].type,'text');assert.ok(payload.max_tokens>0);
+  state=(await request('/api/state')).body;assert.equal(state.settings.model,'claude-another-choice');assert.equal(state.settings.hasKey,true);
+  await request('/api/settings',{provider:'anthropic',enabled:false,model:'claude-another-choice',clearKey:true});
+  assert.equal((await request('/api/state')).body.settings.hasKey,false);
+  await request('/api/settings',{provider:'anthropic',enabled:true,model:'claude-test',apiKey:'saved-anthropic-key'});
+  await request('/api/settings',{provider:'gemini',enabled:true,model:'gemini-test'});
+  assert.equal((await request('/api/state')).body.settings.hasKey,false);
+  await request('/api/settings',{provider:'gemini',enabled:true,model:'gemini-test',apiKey:'gemini-key'});
+  await request('/api/settings',{provider:'anthropic',enabled:true,model:'claude-test'});
+  assert.equal((await request('/api/state')).body.settings.hasKey,false);
+});
+
+test('Anthropic reads card images using the selected model and approves complete contact details',async t=>{
+  const calls=[],contact={name:'Test Person',business:'Example Studio',role:'Designer',emails:['one@example.com','two@example.com'],phones:['+1 202 555 0101','+1 202 555 0102'],notes:''};
+  const {request}=await setup(t,{fetchImpl:async(url,init)=>{
+    calls.push({url,init});const text=JSON.stringify(contact),split=text.indexOf(',');
+    return json({content:[{type:'thinking',thinking:'This is not contact data.'},{type:'text',text:'```json\n'+text.slice(0,split)},{type:'text',text:text.slice(split)+'\n```'}],stop_reason:'end_turn'});
+  }});
+  const ws=(await request('/api/workspaces',{name:'Claude cards'})).body;
+  await request('/api/settings',{provider:'anthropic',enabled:true,model:'claude-user-selected',apiKey:'anthropic-test-key'});
+  for(const mime of ['image/png','image/jpeg','image/webp']) {
+    const uploaded=(await request('/api/uploads',{workspace:ws.id,files:[{...image,mime}]})).body[0];
+    const result=await request(`/api/uploads/${uploaded.id}/extract`,{automatic:true});
+    assert.equal(result.status,200);assert.equal(result.body.status,'approved');assert.equal(result.body.extractionState,'complete');
+    assert.deepEqual(result.body.fields.emails,contact.emails);assert.deepEqual(result.body.fields.phones,contact.phones);
+    const call=calls.at(-1),payload=JSON.parse(call.init.body);
+    assert.equal(call.url,'https://api.anthropic.com/v1/messages');assert.equal(call.init.headers['x-api-key'],'anthropic-test-key');assert.equal(call.init.headers['anthropic-version'],'2023-06-01');assert.equal(call.init.headers.authorization,undefined);assert.equal(call.init.redirect,'error');
+    assert.equal(payload.model,'claude-user-selected');assert.equal(payload.messages[0].role,'user');assert.ok(payload.max_tokens>0);assert.equal(payload.temperature,undefined);
+    assert.deepEqual(payload.messages[0].content[0],{type:'image',source:{type:'base64',media_type:mime,data:pixel}});
+    assert.match(payload.messages[0].content[1].text,/Read this business card/);
+    await request(`/api/uploads/${uploaded.id}/extract`,{automatic:true});
+  }
+  assert.equal(calls.length,3);const state=(await request('/api/state')).body;assert.equal(state.contacts.length,1);assert.deepEqual(state.contacts[0].emails,contact.emails);
+});
+
+test('Anthropic failures leave cards for attention and reject incomplete model lists',async t=>{
+  let mode='error';
+  const {request}=await setup(t,{fetchImpl:async()=>{
+    if(mode==='error')return json({error:{type:'authentication_error',message:'Invalid Anthropic API key'}},401);
+    if(mode==='loop')return json({data:[],has_more:true,last_id:'same'});
+    if(mode==='missing')return json({data:[],has_more:true});
+    if(mode==='empty-list')return json({data:[],has_more:false});
+    return json({content:mode==='empty'?[]:[{type:'text',text:'{"business":"Incomplete","emails":["one@example.com"]}'}],stop_reason:mode});
+  }});
+  const ws=(await request('/api/workspaces',{name:'Claude errors'})).body;
+  await request('/api/settings',{provider:'anthropic',enabled:true,model:'claude-test',apiKey:'test-key'});
+  for(const [failure,message] of [['error',/Invalid Anthropic API key/],['empty',/no readable result/],['max_tokens',/response limit/],['refusal',/declined/]]) {
+    mode=failure;const upload=(await request('/api/uploads',{workspace:ws.id,files:[image]})).body[0];
+    const result=await request(`/api/uploads/${upload.id}/extract`,{automatic:true});
+    assert.equal(result.status,502);assert.match(result.body.error,message);
+    const state=(await request('/api/state')).body,row=state.uploads.find(u=>u.id===upload.id);
+    assert.equal(row.status,'needs_attention');assert.equal(row.extractionState,'failed');assert.equal(state.contacts.length,0);
+  }
+  for(const [failure,message] of [['error',/Invalid Anthropic API key/],['loop',/repeated/],['missing',/next-page cursor/]]) {
+    mode=failure;const result=await request('/api/settings/models',{provider:'anthropic'});assert.equal(result.status,502);assert.match(result.body.error,message);
+  }
+  mode='empty-list';assert.deepEqual((await request('/api/settings/models',{provider:'anthropic'})).body.models,[]);
+});
+
 test('hosted campaigns checkpoint sending before Gmail and resume only untouched recipients',async t=>{
   const mock=upstreamMock();let dataDir;
   const fetchImpl=async(url,init)=>{
@@ -240,7 +409,7 @@ test('card uploads queue automatically, wait for AI setup, and repeated queue re
   assert.equal((await request('/api/state')).body.uploads[1].extractionState,'needs_setup');
 });
 
-test('automatic reading failures preserve cards and require an explicit retry',async t=>{
+test('automatic reading failures preserve cards and allow one automatic retry',async t=>{
   let calls=0;
   const {request}=await setup(t,{fetchImpl:async()=>{calls++;return calls===1?json({error:{message:'Provider quota exceeded'}},429):json({candidates:[{content:{parts:[{text:'{"business":"Recovered","emails":["hello@example.com"]}'}]}}]});}});
   const ws=(await request('/api/workspaces',{name:'Retry scanning'})).body;
@@ -248,8 +417,10 @@ test('automatic reading failures preserve cards and require an explicit retry',a
   const upload=(await request('/api/uploads',{workspace:ws.id,files:[image]})).body[0];
   assert.equal((await request(`/api/uploads/${upload.id}/extract`,{automatic:true})).status,502);
   let row=(await request('/api/state')).body.uploads[0];assert.equal(row.extractionState,'failed');assert.equal(row.status,'needs_attention');assert.equal(row.assetId,upload.assetId);
-  await request(`/api/uploads/${upload.id}/extract`,{automatic:true});assert.equal(calls,1);
-  const retried=await request(`/api/uploads/${upload.id}/extract`,{});assert.equal(retried.body.extractionState,'complete');assert.equal(calls,2);
+  assert.equal(row.automaticRetryPending,true);assert.equal(row.automaticAttempts,1);
+  const retried=await request(`/api/uploads/${upload.id}/extract`,{automatic:true});assert.equal(retried.body.extractionState,'complete');assert.equal(calls,2);
+  assert.equal(retried.body.automaticRetryPending,false);assert.equal(retried.body.assetId,undefined);assert.ok(retried.body.imageRemovedAt);
+  await request(`/api/uploads/${upload.id}/extract`,{automatic:true});assert.equal(calls,2);
 });
 
 test('automatic extraction approves, merges a unique phone duplicate, and syncs the spreadsheet',async t=>{
@@ -393,4 +564,188 @@ test('bulk audience includes fresh spreadsheet addresses, respects exclusions an
   const sent=await request(`/api/campaigns/${created.body.id}/send`,{confirm:true});
   assert.equal(sent.status,200);assert.equal(sent.body.status,'sent');assert.equal(mock.sends.length,3);
   assert.ok(mock.sends.every(m=>m.includes('From: sender@example.com\r\n')));
+});
+
+async function batchFixture(t,count,{hosted=false,intercept}={}) {
+  const mock=upstreamMock();
+  const app=await setup(t,{fetchImpl:async(url,init)=>url==='https://gmail.googleapis.com/gmail/v1/users/me/messages/send'&&intercept?intercept(url,init,mock):mock.fetchImpl(url,init),
+    env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret',GATHER_TEST:'1',...(hosted?{GATHER_HOSTED:'1'}:{})}});
+  const {request}=app;await connect(request,'gmail');await connect(request,'sheets');
+  const ws=(await request('/api/workspaces',{name:'Automatic batches'})).body;
+  const sheet=(await request(`/api/workspaces/${ws.id}/sheet`,{mode:'create'})).body.sheetId;
+  mock.sheets.get(sheet).push(...Array.from({length:count},(_,i)=>['',`Contact ${i}`,'Business','','person'+i+'@example.com','','','']));
+  mock.sheets.get(sheet).push(['','Duplicate','','','PERSON0@example.com','','',''],['','Excluded','','','excluded@example.com','','','']);
+  const template=(await request('/api/templates',{workspace:ws.id,name:'Batch template',subject:'Frozen subject',body:'Hello {{business_name}}',assetIds:[]})).body;
+  const created=await request('/api/campaigns',{workspace:ws.id,name:'Entire sheet',templateId:template.id,audience:'workspace',excludedEmails:['excluded@example.com'],batchSize:1});
+  assert.equal(created.status,201);assert.equal(created.body.recipients.length,count);assert.equal(created.body.batchSize,100);assert.equal(mock.sends.length,0);
+  return {...app,mock,campaign:created.body,template,ws};
+}
+
+test('40 uploaded cards process in groups of 10, retry once, and delete only successfully saved card images',async t=>{
+  let dataDir;const calls=new Map(),order=[];
+  const app=await setup(t,{fetchImpl:async()=>{
+    const stored=JSON.parse(readFileSync(join(dataDir,'gather.json'),'utf8')),card=stored.uploads.find(u=>u.extractionState==='extracting');
+    const count=(calls.get(card.filename)||0)+1;calls.set(card.filename,count);order.push(card.filename);
+    if(card.filename==='card-17.png'||(card.filename==='card-2.png'&&count===1))return json({error:{message:'Temporary model failure'}},503);
+    const number=card.filename.match(/\d+/)[0];
+    return json({candidates:[{content:{parts:[{text:JSON.stringify({name:'Person '+number,emails:[`person${number}@example.com`]})}]}}]});
+  }});
+  dataDir=app.dataDir;const {request}=app;
+  const ws=(await request('/api/workspaces',{name:'40 cards'})).body;
+  await request('/api/settings',{provider:'gemini',enabled:true,model:'test-card-reader',apiKey:'test-key'});
+  const added=await request('/api/uploads',{workspace:ws.id,files:Array.from({length:40},(_,i)=>({...image,name:`card-${i}.png`}))});
+  assert.equal(added.status,201);assert.equal(added.body.length,40);
+  assert.equal((await request('/api/uploads',{workspace:ws.id,files:Array(41).fill(image)})).status,400);
+  const result=await globalThis.GatherCore.runCardBatches(added.body,{wait:async()=>{},extract:async card=>{
+    const response=await request(`/api/uploads/${card.id}/extract`,{automatic:true});
+    if(response.status!==200)throw Error(response.body.error);return response.body;
+  }});
+  assert.equal(result.totalBatches,4);assert.equal(result.completed,39);assert.equal(result.failed.length,1);
+  assert.deepEqual(order.slice(0,11),[...Array.from({length:10},(_,i)=>`card-${i}.png`),'card-2.png']);
+  const state=(await request('/api/state')).body;assert.equal(state.limits.maxCardUploads,40);assert.equal(state.contacts.length,39);assert.equal(state.assets.length,1);
+  for(const original of added.body) {
+    const saved=state.uploads.find(u=>u.id===original.id),failed=original.filename==='card-17.png';
+    assert.equal(existsSync(join(dataDir,original.assetId)),failed);
+    if(failed){assert.equal(saved.assetId,original.assetId);assert.equal(saved.automaticAttempts,2);assert.equal(saved.automaticRetryPending,false);assert.equal(saved.status,'needs_attention');}
+    else {assert.equal(saved.status,'approved');assert.equal(saved.assetId,undefined);assert.ok(saved.imageRemovedAt);assert.equal((await request('/assets/'+original.assetId)).status,404);}
+  }
+  await request(`/api/uploads/${result.failed[0].id}/extract`,{automatic:true});assert.equal(calls.get('card-17.png'),2);
+});
+
+test('automatic retry budgets survive restart and an interrupted second attempt cannot run again',async t=>{
+  let calls=0;
+  const {request,restart,dataDir}=await setup(t,{fetchImpl:async()=>{calls++;return json({error:{message:'Provider unavailable'}},503);}});
+  const ws=(await request('/api/workspaces',{name:'Retry budget'})).body;
+  await request('/api/settings',{provider:'gemini',enabled:true,model:'test',apiKey:'test-key'});
+  const card=(await request('/api/uploads',{workspace:ws.id,files:[image]})).body[0];
+  await request(`/api/uploads/${card.id}/extract`,{automatic:true});await restart();
+  let saved=(await request('/api/state')).body.uploads[0];assert.equal(saved.automaticRetryPending,true);assert.equal(saved.automaticAttempts,1);
+  await request(`/api/uploads/${card.id}/extract`,{automatic:true});assert.equal(calls,2);
+  const file=join(dataDir,'gather.json'),db=JSON.parse(readFileSync(file,'utf8'));db.uploads[0].extractionState='extracting';writeFileSync(file,JSON.stringify(db));await restart();
+  saved=(await request('/api/state')).body.uploads[0];assert.equal(saved.automaticRetryPending,false);assert.equal(saved.automaticAttempts,2);
+  await request(`/api/uploads/${card.id}/extract`,{automatic:true});assert.equal(calls,2);assert.equal(existsSync(join(dataDir,card.assetId)),true);
+});
+
+test('image cleanup checkpoints the contact before deleting and retries deletion without re-reading the card',async t=>{
+  let dataDir,deletions=0,modelCalls=0;
+  const {request,dataDir:directory}=await setup(t,{fetchImpl:async()=>{modelCalls++;return json({candidates:[{content:{parts:[{text:'{"name":"Saved contact","emails":["saved@example.com"]}'}]}}]});},
+    onDelete:async aid=>{
+      deletions++;const db=JSON.parse(readFileSync(join(dataDir,'gather.json'),'utf8')),upload=db.uploads.find(u=>u.assetId===aid);
+      assert.equal(upload.status,'approved');assert.equal(upload.imageCleanupPending,true);assert.ok(db.contacts.some(c=>c.id===upload.contactId));
+      if(deletions===1)throw Error('Storage deletion temporarily unavailable');
+    }});
+  dataDir=directory;
+  const ws=(await request('/api/workspaces',{name:'Cleanup'})).body;
+  await request('/api/settings',{provider:'gemini',enabled:true,model:'test',apiKey:'key'});
+  const card=(await request('/api/uploads',{workspace:ws.id,files:[image]})).body[0];
+  const result=await request(`/api/uploads/${card.id}/extract`,{automatic:true});
+  assert.equal(result.status,200);assert.equal(result.body.status,'approved');assert.equal(result.body.imageCleanupPending,true);assert.equal(existsSync(join(dataDir,card.assetId)),true);
+  const state=(await request('/api/state')).body;
+  assert.equal(deletions,2);assert.equal(modelCalls,1);assert.equal(state.uploads[0].assetId,undefined);assert.equal(state.contacts.length,1);assert.equal(existsSync(join(dataDir,card.assetId)),false);
+});
+
+test('cleanup can recover when the image was removed but its final metadata checkpoint failed',async t=>{
+  let dataDir,failOnce=true,deletions=0,modelCalls=0;
+  const app=await setup(t,{fetchImpl:async()=>{modelCalls++;return json({candidates:[{content:{parts:[{text:'{"name":"Saved","emails":["saved@example.com"]}'}]}}]});},onDelete:async()=>{deletions++;},onPersist:async name=>{
+    if(dataDir&&name==='gather.json'&&failOnce&&JSON.parse(readFileSync(join(dataDir,name),'utf8')).uploads.some(u=>u.imageRemovedAt)){failOnce=false;throw Error('Checkpoint unavailable');}
+  }});
+  dataDir=app.dataDir;const {request,restart}=app;
+  const ws=(await request('/api/workspaces',{name:'Interrupted cleanup'})).body;
+  await request('/api/settings',{provider:'gemini',enabled:true,model:'test',apiKey:'key'});
+  const card=(await request('/api/uploads',{workspace:ws.id,files:[image]})).body[0];
+  const result=await request(`/api/uploads/${card.id}/extract`,{automatic:true});
+  assert.equal(result.body.status,'approved');assert.equal(result.body.imageCleanupPending,true);assert.equal(existsSync(join(dataDir,card.assetId)),false);
+  await restart();const state=(await request('/api/state')).body;
+  assert.ok(state.uploads[0].imageRemovedAt);assert.equal(state.uploads[0].assetId,undefined);assert.equal(state.assets.length,0);assert.equal(state.contacts.length,1);assert.equal(deletions,2);assert.equal(modelCalls,1);
+});
+
+test('a failed contact checkpoint keeps the original card and never starts image cleanup',async t=>{
+  let dataDir,deletions=0,failOnce=true;
+  const app=await setup(t,{fetchImpl:upstreamMock().fetchImpl,onDelete:async()=>{deletions++;},onPersist:async name=>{
+    if(dataDir&&name==='gather.json'&&failOnce&&JSON.parse(readFileSync(join(dataDir,name),'utf8')).uploads.some(u=>u.status==='approved')){failOnce=false;throw Error('Contact checkpoint unavailable');}
+  }});
+  dataDir=app.dataDir;const {request}=app;const ws=(await request('/api/workspaces',{name:'Failed save'})).body;
+  await request('/api/settings',{provider:'gemini',enabled:true,model:'test',apiKey:'key'});
+  const card=(await request('/api/uploads',{workspace:ws.id,files:[image]})).body[0];
+  assert.equal((await request(`/api/uploads/${card.id}/extract`,{automatic:true})).status,500);
+  assert.equal(deletions,0);assert.equal(existsSync(join(dataDir,card.assetId)),true);
+});
+
+test('cleanup preserves card images referenced by an email template and unrelated attachments',async t=>{
+  const {request,dataDir}=await setup(t,{fetchImpl:upstreamMock().fetchImpl});
+  const ws=(await request('/api/workspaces',{name:'Shared image'})).body;
+  await request('/api/settings',{provider:'gemini',enabled:true,model:'test',apiKey:'key'});
+  const card=(await request('/api/uploads',{workspace:ws.id,files:[image]})).body[0],attachment=(await request('/api/assets',image)).body;
+  await request('/api/templates',{workspace:ws.id,name:'Shared photo',subject:'Hello',body:'Message',assetIds:[card.assetId,attachment.id]});
+  const result=await request(`/api/uploads/${card.id}/extract`,{automatic:true});assert.equal(result.body.status,'approved');
+  assert.equal(result.body.assetId,card.assetId);assert.equal(existsSync(join(dataDir,card.assetId)),true);assert.equal(existsSync(join(dataDir,attachment.id)),true);
+  assert.equal((await request('/api/state')).body.assets.length,2);
+});
+
+test('537 spreadsheet emails send automatically as six batches after one confirmation flow',async t=>{
+  const {request,mock,campaign,template}=await batchFixture(t,537);const steps=[];
+  assert.equal((await request(`/api/campaigns/${campaign.id}/send`,{compact:true})).status,400);
+  assert.equal(mock.sends.length,0);
+  await request('/api/templates',{...template,subject:'Must not replace the approved draft'});
+  const result=await globalThis.GatherCore.runCampaign(async()=>{
+    const response=await request(`/api/campaigns/${campaign.id}/send`,{confirm:true,compact:true});
+    assert.equal(response.status,200);assert.equal(response.body.recipients,undefined);
+    return response.body;
+  },{wait:async()=>{},onProgress:r=>steps.push(r.progress.sent)});
+  assert.equal(result.status,'sent');assert.deepEqual(steps,[100,200,300,400,500,537]);
+  assert.equal(result.progress.totalBatches,6);assert.equal(result.progress.completedBatches,6);assert.equal(result.progress.batchTotal,37);
+  const addresses=mock.sends.map(m=>m.match(/To: ([^\r]+)/)[1]);assert.equal(addresses.length,537);assert.equal(new Set(addresses).size,537);assert.ok(!addresses.includes('excluded@example.com'));
+  assert.ok(mock.sends.every(m=>m.includes(`Subject: =?UTF-8?B?${Buffer.from('Frozen subject').toString('base64')}?=`)));
+  const saved=(await request('/api/state')).body.campaigns[0];assert.ok(saved.confirmedAt);assert.equal(saved.recipients.filter(r=>r.messageId&&r.sentAt).length,537);
+  assert.equal((await request(`/api/campaigns/${campaign.id}/send`,{confirm:true})).status,409);assert.equal(mock.sends.length,537);
+});
+
+test('hosted sending crosses batch boundaries and resumes after restart without repeating recipients',async t=>{
+  const {request,mock,campaign,restart}=await batchFixture(t,103,{hosted:true});let requests=0,confirmedAt;
+  const result=await globalThis.GatherCore.runCampaign(async()=>{
+    const response=await request(`/api/campaigns/${campaign.id}/send`,{confirm:true,compact:true});requests++;
+    assert.equal(response.status,200);assert.equal(response.body.progress.sent,requests);
+    if(requests===100)assert.equal(response.body.progress.completedBatches,1);
+    if(requests===101){confirmedAt=(await request('/api/state')).body.campaigns[0].confirmedAt;await restart();}
+    return response.body;
+  },{wait:async()=>{}});
+  assert.equal(result.status,'sent');assert.equal(result.progress.completedBatches,2);assert.equal(requests,103);assert.equal(mock.sends.length,103);
+  assert.equal(new Set(mock.sends.map(m=>m.match(/To: ([^\r]+)/)[1])).size,103);
+  assert.equal((await request('/api/state')).body.campaigns[0].confirmedAt,confirmedAt);
+});
+
+test('Gmail quota pauses the current batch, persists cooldown, and retries only the rejected recipient',async t=>{
+  for(const status of [429,403])await t.test(`HTTP ${status}`,async t=>{
+    let rejected=false,attempts=0;
+    const {request,mock,campaign,dataDir,restart}=await batchFixture(t,103,{intercept:async(url,init,mock)=>{
+      attempts++;
+      if(mock.sends.length===100&&!rejected){rejected=true;return new Response(JSON.stringify({error:{message:'Gmail quota reached',errors:[{reason:'userRateLimitExceeded'}]}}),{status,headers:{'content-type':'application/json','retry-after':'120'}});}
+      return mock.fetchImpl(url,init);
+    }});
+    assert.equal((await request(`/api/campaigns/${campaign.id}/send`,{confirm:true})).body.status,'paused');assert.equal(mock.sends.length,100);
+    let response=await request(`/api/campaigns/${campaign.id}/send`,{confirm:true,compact:true});
+    assert.equal(response.body.status,'waiting');assert.equal(response.body.progress.sent,100);assert.equal(response.body.progress.pending,3);assert.equal(response.body.progress.failed,0);assert.ok(Date.parse(response.body.retryAt)>Date.now()+110000);
+    await restart();response=await request(`/api/campaigns/${campaign.id}/send`,{confirm:true});
+    assert.equal(response.body.status,'waiting');assert.equal(response.body.recipients[100].status,'pending');assert.equal(attempts,101);
+    const file=join(dataDir,'gather.json'),db=JSON.parse(readFileSync(file,'utf8'));db.campaigns[0].retryAt=new Date(Date.now()-1000).toISOString();writeFileSync(file,JSON.stringify(db));
+    await restart();response=await request(`/api/campaigns/${campaign.id}/send`,{confirm:true,compact:true});
+    assert.equal(response.body.status,'sent');assert.equal(response.body.retryAt,undefined);assert.equal(mock.sends.length,103);assert.equal(attempts,104);
+    assert.equal(new Set(mock.sends.map(m=>m.match(/To: ([^\r]+)/)[1])).size,103);
+  });
+});
+
+test('unknown deliveries and permission failures stop later batches without an automatic retry',async t=>{
+  for(const mode of ['unknown','permission'])await t.test(mode,async t=>{
+    let attempts=0;
+    const {request,mock,campaign}=await batchFixture(t,205,{intercept:async(url,init,mock)=>{
+      attempts++;
+      if(attempts===102){if(mode==='unknown')throw Error('Transport lost after Gmail submission');return json({error:{message:'Permission denied',errors:[{reason:'domainPolicy'}]}},403);}
+      return mock.fetchImpl(url,init);
+    }});
+    const result=await globalThis.GatherCore.runCampaign(async()=>{
+      const response=await request(`/api/campaigns/${campaign.id}/send`,{confirm:true,compact:true});assert.equal(response.status,200);return response.body;
+    },{wait:async()=>{}});
+    assert.equal(result.status,'needs_attention');assert.equal(result.progress.sent,101);assert.equal(result.progress.pending,103);assert.equal(result.progress[mode==='unknown'?'unknown':'failed'],1);assert.equal(attempts,102);
+    assert.equal((await request(`/api/campaigns/${campaign.id}/send`,{confirm:true})).status,409);assert.equal(attempts,102);assert.equal(mock.sends.length,101);
+  });
 });

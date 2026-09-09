@@ -7,12 +7,14 @@ import {randomBytes} from 'node:crypto';
 import {createGather} from '../server.mjs';
 import {seal,unseal,storageKey} from '../cloud/postgres.mjs';
 
-async function setup(t) {
+async function setup(t,{fetchImpl=fetch,onDelete=async()=>{}}={}) {
   const saved=new Map(),dataDir=mkdtempSync(join(tmpdir(),'gather-hosting-'));
   const env={GATHER_HOSTED:'1',GATHER_PUBLIC_ORIGIN:'https://gather.example',GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret',GATHER_TEST:'1'};
   const saves=[];let failSave=false;
   const onPersist=async name=>{if(failSave)throw Error('Durable storage unavailable');await new Promise(r=>setTimeout(r,1));const value=readFileSync(join(dataDir,name));saved.set(name,value);saves.push(name);};
-  let app=createGather({dataDir,env,onPersist});await app.ready;
+  const remove=async name=>{await onDelete(name,saved);saved.delete(name);};
+  const getAsset=async name=>saved.get(name);
+  let app=createGather({dataDir,env,onPersist,fetchImpl,onDelete:remove,getAsset});await app.ready;
   t.after(()=>rmSync(dataDir,{recursive:true,force:true}));
   const request=async(path,body,cookie='',host='gather.example')=>{
     const {Readable}=await import('node:stream');
@@ -23,7 +25,7 @@ async function setup(t) {
     await app.handler(req,res);let json;try{json=JSON.parse(text);}catch{}
     return {status,body:json,text,headers,cookie:headers['set-cookie']?.split(';')[0]};
   };
-  return {request,saved,saves,dataDir,failSaves:()=>{failSave=true;},async restart(){app=createGather({dataDir,env,onPersist});await app.ready;}};
+  return {request,saved,saves,dataDir,failSaves:()=>{failSave=true;},async restart(){app=createGather({dataDir,env,onPersist,fetchImpl,onDelete:remove,getAsset});await app.ready;}};
 }
 
 test('hosted authentication survives reconstruction, uses Secure cookies, and binds the public origin',async t=>{
@@ -122,4 +124,29 @@ test('unstarted AI cards stay queued after restart; interrupted readings require
   assert.equal(state.uploads[1].extractionState,'queued');
   const retry=await request('/api/uploads/'+state.uploads[0].id+'/extract',{automatic:true},account.cookie);
   assert.equal(retry.status,200);assert.equal(retry.body.extractionState,'failed');
+});
+
+test('hosted extraction deletes only the member’s stored card after its contact is durably saved',async t=>{
+  let memberId;const removed=[];
+  const {request,saved,dataDir}=await setup(t,{fetchImpl:async()=>new Response(JSON.stringify({candidates:[{content:{parts:[{text:'{"name":"Member contact","emails":["member-contact@example.com"]}'}]}}]}),{headers:{'content-type':'application/json'}}),
+    onDelete:async(name,records)=>{
+      const prefix=`accounts/${memberId}/`;assert.ok(name.startsWith(prefix));removed.push(name);
+      const data=JSON.parse(records.get(prefix+'gather.json').toString());assert.equal(data.contacts.length,1);assert.equal(data.uploads[0].status,'approved');assert.equal(data.uploads[0].imageCleanupPending,true);
+    }});
+  const admin=await request('/api/auth/setup',{name:'Owner',email:'owner@example.com',password:'private owner password'});
+  const ownerWorkspace=await request('/api/workspaces',{name:'Owner cards'},admin.cookie);
+  const ownerCard=await request('/api/uploads',{workspace:ownerWorkspace.body.id,files:[{name:'owner.png',mime:'image/png',data:'b3duZXI='}]},admin.cookie);
+  const member=await request('/api/auth/register',{name:'Member',email:'member@example.com',password:'private member password'});memberId=member.body.user.id;
+  const workspace=await request('/api/workspaces',{name:'Member cards'},member.cookie);
+  await request('/api/settings',{provider:'gemini',enabled:true,model:'test',apiKey:'test-key'},member.cookie);
+  const uploaded=await request('/api/uploads',{workspace:workspace.body.id,files:[{name:'member.png',mime:'image/png',data:'bWVtYmVy'}]},member.cookie),card=uploaded.body[0];
+  const remoteName=`accounts/${memberId}/${card.assetId}`;assert.ok(saved.has(remoteName));
+  // The next request must read the image from cloud storage, with no local copy.
+  rmSync(join(dataDir,remoteName),{force:true});
+  const result=await request(`/api/uploads/${card.id}/extract`,{automatic:true},member.cookie);
+  assert.equal(result.status,200);assert.equal(result.body.status,'approved');assert.ok(result.body.imageRemovedAt);assert.equal(result.body.assetId,undefined);
+  assert.deepEqual(removed,[remoteName]);assert.equal(saved.has(remoteName),false);assert.equal(saved.has(ownerCard.body[0].assetId),true);
+  assert.equal((await request('/assets/'+card.assetId,undefined,member.cookie)).status,404);
+  assert.equal((await request('/assets/'+ownerCard.body[0].assetId,undefined,admin.cookie)).text,'owner');
+  const memberData=JSON.parse(saved.get(`accounts/${memberId}/gather.json`).toString());assert.equal(memberData.assets.length,0);assert.equal(memberData.contacts[0].emails[0],'member-contact@example.com');
 });

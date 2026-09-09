@@ -43,6 +43,7 @@ export async function openStore(env=process.env) {
       client,
       async read(name){const result=await query('SELECT bytes FROM gather_files WHERE name=$1',[name]);return result.rows[0]?unseal(result.rows[0].bytes,key):null;},
       async write(name,bytes){await query('INSERT INTO gather_files(name,bytes) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET bytes=EXCLUDED.bytes',[name,seal(bytes,key)]);},
+      async remove(name){await query('DELETE FROM gather_files WHERE name=$1',[name]);},
       async close(){try{if(!broken)await client.query('SELECT pg_advisory_unlock(714032681)');}finally{await client.end().catch(()=>{});}},
     };
   } catch(error) {await client.end().catch(()=>{});throw error;}

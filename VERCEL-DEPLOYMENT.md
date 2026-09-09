@@ -91,4 +91,24 @@ These static pages are available without login, are included in the explicit dep
 
 ## Automatic card extraction
 
-Uploads record a durable extraction state: queued, needs_setup, extracting, complete, or failed. The browser starts pending cards automatically after upload, settings setup, or a fresh page load, using one extraction request per card. It must remain open to progress through the queue. Only unstarted queued cards resume automatically; failed or interrupted readings require a retry. Automatic requests for already-read or resolved cards do not call the AI again. Valid extracted cards are approved immediately and synced to the workspace spreadsheet. A unique email or phone duplicate merges automatically; a business-name-only match remains separate. Invalid or insufficient extracted data remains available for attention. A browser flow verified two same-phone Harbor cards merging both emails without a review click. The provider key/model is still configured separately for each account.
+Uploads record a durable extraction state: queued, needs_setup, extracting, complete, or failed. The browser starts pending cards automatically after upload, settings setup, or a fresh page load, using one extraction request per card. It must remain open to progress through the queue. Queued cards and an unused automatic retry resume on return; exhausted retries require manual attention. Automatic requests for already-read or resolved cards do not call the AI again. Valid extracted cards are approved immediately and synced to the workspace spreadsheet. A unique email or phone duplicate merges automatically; a business-name-only match remains separate. Invalid or insufficient extracted data remains available for attention. A browser flow verified two same-phone Harbor cards merging both emails without a review click. The provider key/model is still configured separately for each account.
+
+## Automatic email batches
+
+Campaigns now accept the complete eligible spreadsheet audience and partition it into batches of up to 100. One final confirmation authorizes the frozen list and starts automatic sequential progression through every batch. Hosted requests still submit one recipient at a time; compact progress responses avoid returning the full audience after each message. Campaign views show sent totals and completed batches, and allow pausing/resuming.
+
+Explicit Gmail 429 or recognized 403 quota rejections preserve the recipient as pending and persist a retry time. While the tab stays open, the runner waits and continues automatically after that time; closing it requires resuming the campaign on return. There is no independent background worker. Other failures and ambiguous outcomes stop for attention, and confirmed or uncertain sends are never automatically repeated. This handling follows [Google’s Gmail error guidance](https://developers.google.com/workspace/gmail/api/guides/handle-errors).
+
+Verification uses mocked Gmail and Sheets: 537 addresses across six batches, hosted continuation across restart, duplicate/excluded-address handling, saved cooldowns for 429/403 responses, and stopping on unknown deliveries or permission failures. No real email is sent by these checks.
+
+## Card batches and image cleanup
+
+The browser accepts up to 40 card photos per selection and processes them in logical groups of 10. Hosted uploads still transfer one image per request, and extraction uses one image per model request to fit payload and execution limits. Within each group, only failed cards get one automatic retry. The persisted retry count caps automatic extraction at two model attempts per card, including across restarts. Exhausted cards keep their images for review.
+
+After contact approval is durably saved, the backend checkpoints cleanup intent, deletes the account-scoped PostgreSQL image record and local file, then removes its asset reference. Contact details and upload history remain with an image-removed status. Cleanup failures remain pending and are retried on refresh or restart without re-extracting. Existing successfully extracted and approved cards are included in cleanup. Photos referenced by other uploads, templates, or frozen campaigns are preserved.
+
+Tests cover 40 cards in four groups, isolated retries, successful-file removal, retained failed images, interrupted cleanup, failed contact checkpoints, and deletion under the correct member account prefix. Verification uses temporary images and mocked providers/storage. All 88 tests pass. A browser upload of 40 images saved 40 contacts with 41 model attempts (one intentional transient failure), removed all 40 image assets and local files, and displayed the removal status for every card.
+
+## Anthropic Claude support
+
+Settings includes Anthropic Claude with an encrypted API key and a selectable model. The native Models API loads the account-specific list with pagination; card extraction uses the native Messages API and the selected model. Mocked tests cover key isolation, model selection, image messages, failures, and incomplete responses. No real provider requests were needed for release verification.
