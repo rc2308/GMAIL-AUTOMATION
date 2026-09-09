@@ -15,6 +15,12 @@ const fail = (message, status = 400) => { throw Object.assign(Error(message), {s
 const required = (value, label) => String(value || '').trim() || fail(`${label} is required.`);
 const escape = text => String(text || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const imageTypes = new Set(['image/jpeg','image/png','image/webp']);
+const attachmentTypes = new Map([
+  ['application/pdf','.pdf'],
+  ['application/vnd.openxmlformats-officedocument.presentationml.presentation','.pptx'],
+]);
+const attachmentLimit=25_000_000,attachmentChunkLimit=2*1024*1024;
+const staleAttachmentAge=24*60*60*1000;
 
 export function createGather({dataDir=join(ROOT,'data'),env=process.env,fetchImpl=fetch,onPersist=async()=>{},getAsset=null,onDelete=null,loadAccount=async()=>{}}={}) {
   mkdirSync(dataDir,{recursive:true,mode:0o700});
@@ -93,12 +99,13 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
       upload.extractionState=extractionReady()?'queued':'needs_setup';upload.status='uploaded';upload.error='';
     }
   }
-  const ready=persist().then(cleanupSavedCardImages);
+  const ready=persist().then(cleanupSavedCardImages).then(cleanupStaleAttachmentUploads);
   const workspace = wid => db.workspaces.find(row => row.id === wid) || fail('Workspace not found.',404);
   const inWorkspace = (list,wid) => list.filter(row => row.workspace === wid);
   const oauthReady = () => Boolean(env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET);
   const publicState = () => ({
-    ...db, pendingOAuth:undefined, sheetImportJobs:undefined, sheetImportVersion:SHEET_IMPORT_VERSION, limits:{imageMB:hosted?3:8,uploadBatch:hosted?1:2,maxCardUploads:C.cardUploadLimit,extractionBatchSize:C.cardBatchSize}, settings:{...db.settings, secret:undefined, hasKey:Boolean(db.settings.secret),extractionReady:extractionReady()},
+    ...db, assets:db.assets.filter(asset=>asset.uploadState!=='uploading').map(({chunks,uploadState,...asset})=>asset), pendingOAuth:undefined, sheetImportJobs:undefined, sheetImportVersion:SHEET_IMPORT_VERSION,
+    limits:{imageMB:hosted?3:8,uploadBatch:hosted?1:2,maxCardUploads:C.cardUploadLimit,extractionBatchSize:C.cardBatchSize,attachmentMB:25,attachmentBytes:attachmentLimit,attachmentChunkMB:2}, settings:{...db.settings, secret:undefined, hasKey:Boolean(db.settings.secret),extractionReady:extractionReady()},
     connections:Object.fromEntries(['gmail','sheets'].map(kind => [kind, db.connections[kind]
       ? {connected:!db.connections[kind].error,email:db.connections[kind].email,error:db.connections[kind].error || null}
       : {connected:false,email:null}])),
@@ -129,16 +136,72 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
   async function google(kind, url, init={}) {
     return remote(url,{...init,headers:{'content-type':'application/json',...(init.headers||{}),authorization:`Bearer ${await token(kind)}`}});
   }
+  const cleanFilename=value=>String(value||'attachment').normalize('NFC').replace(/[\u0000-\u001f\u007f/\\]/g,' ').replace(/\s+/g,' ').trim().slice(0,180)||'attachment';
   async function assetFile(raw) {
     if (!imageTypes.has(raw.mime)) fail('Use a JPEG, PNG, or WebP image.');
     if (!/^[A-Za-z0-9+/=]+$/.test(raw.data || '')) fail('Image data is invalid.');
     const bytes=Buffer.from(raw.data,'base64');
     if(bytes.length>(hosted?3:8)*1024*1024)fail(`Each image must be smaller than ${hosted?3:8} MB.`);
     const aid=id();writeFileSync(join(dataDir,aid),bytes,{mode:0o600});await onPersist(aid);
-    const asset={id:aid,name:String(raw.name || 'image').slice(0,180),mime:raw.mime,size:bytes.length};db.assets.push(asset);return asset;
+    const asset={id:aid,name:cleanFilename(raw.name||'image'),mime:raw.mime,size:bytes.length,kind:'inline'};db.assets.push(asset);return asset;
   }
-  const assetsFor = ids => (ids||[]).map(aid => db.assets.find(a => a.id === aid) || fail('Image not found.'));
-  const readAsset = async aid => existsSync(join(dataDir,aid))?readFileSync(join(dataDir,aid)):getAsset?getAsset(aid):fail('Image not found.',404);
+  const assetsFor = ids => (ids||[]).map(aid => {
+    const asset=db.assets.find(a=>a.id===aid&&a.uploadState!=='uploading');return asset||fail('Attachment not found.');
+  });
+  const readStored=async name=>existsSync(join(dataDir,name))?readFileSync(join(dataDir,name)):getAsset?getAsset(name):fail('Attachment not found.',404);
+  const deleteStored=async name=>{
+    if(onDelete)await onDelete(name);
+    else if(getAsset)throw Error('Remote attachment deletion is unavailable.');
+    rmSync(join(dataDir,name),{force:true});
+  };
+  const readAsset=async aid=>{
+    const asset=db.assets.find(a=>a.id===aid);
+    if(asset?.uploadState==='uploading')fail('This attachment is still uploading.',409);
+    return asset?.chunks?.length?Buffer.concat(await Promise.all(asset.chunks.map(chunk=>readStored(chunk.name)))):readStored(aid);
+  };
+  const templateBytes=assetIds=>assetsFor(assetIds).reduce((sum,asset)=>sum+asset.size,0);
+  const checkTemplateLimit=assetIds=>{
+    if(templateBytes(assetIds)>attachmentLimit)fail('Keep all template images and attachments within Gmail’s 25 MB attachment limit.',413);
+  };
+  async function startAttachment(raw){
+    const name=cleanFilename(raw.name),mime=String(raw.mime||''),expected=attachmentTypes.get(mime),size=Number(raw.size);
+    if(!expected||!name.toLowerCase().endsWith(expected))fail('Use a PDF or PowerPoint (.pptx) file.');
+    if(!Number.isSafeInteger(size)||size<1||size>attachmentLimit)fail('Keep each attachment at or below 25 MB.');
+    if(db.assets.filter(asset=>asset.uploadState==='uploading').length>=4)fail('Finish or wait for existing attachment uploads before starting another.',429);
+    const asset={id:id(),name,mime,size,kind:'attachment',uploadState:'uploading',uploadedBytes:0,chunks:[],createdAt:now()};
+    db.assets.push(asset);await persist();return {...asset,chunks:undefined};
+  }
+  async function addAttachmentChunk(aid,raw){
+    const asset=db.assets.find(a=>a.id===aid&&a.uploadState==='uploading')||fail('Attachment upload not found.',404);
+    const index=Number(raw.index);if(!Number.isSafeInteger(index)||index<0)fail('Invalid attachment chunk.');
+    if(asset.chunks[index])return {uploadedBytes:asset.uploadedBytes,complete:asset.uploadedBytes===asset.size};
+    if(index!==asset.chunks.length||typeof raw.data!=='string'||!raw.data.length||!/^[A-Za-z0-9+/]+={0,2}$/.test(raw.data))fail('Upload attachment chunks in order.');
+    const bytes=Buffer.from(raw.data,'base64');
+    if(!bytes.length||bytes.length>attachmentChunkLimit||asset.uploadedBytes+bytes.length>asset.size)fail('Invalid attachment chunk size.',413);
+    const name=`${asset.id}.part-${index}`;writeFileSync(join(dataDir,name),bytes,{mode:0o600});await onPersist(name);
+    asset.chunks.push({name,size:bytes.length});asset.uploadedBytes+=bytes.length;await persist();
+    return {uploadedBytes:asset.uploadedBytes,complete:asset.uploadedBytes===asset.size};
+  }
+  const readAssetChunks=asset=>Promise.all(asset.chunks.map(chunk=>readStored(chunk.name))).then(parts=>Buffer.concat(parts));
+  async function discardAttachment(asset){
+    const removed=await Promise.allSettled((asset.chunks||[]).map(chunk=>deleteStored(chunk.name)));
+    if(removed.some(result=>result.status==='rejected'))return false;
+    db.assets=db.assets.filter(item=>item.id!==asset.id);await persist();return true;
+  }
+  async function cleanupStaleAttachmentUploads(){
+    const cutoff=Date.now()-staleAttachmentAge;
+    for(const asset of db.assets.filter(item=>item.uploadState==='uploading'&&Date.parse(item.createdAt||'')<cutoff))await discardAttachment(asset);
+  }
+  async function finishAttachment(aid){
+    const asset=db.assets.find(a=>a.id===aid&&a.uploadState==='uploading')||fail('Attachment upload not found.',404);
+    if(asset.uploadedBytes!==asset.size)fail('The attachment upload is incomplete.',409);
+    const bytes=await readAssetChunks(asset),expected=attachmentTypes.get(asset.mime);
+    const validPdf=expected!=='.pdf'||bytes.subarray(0,5).equals(Buffer.from('%PDF-'));
+    const validPptx=expected!=='.pptx'||(bytes[0]===0x50&&bytes[1]===0x4b&&[0x03,0x05,0x07].includes(bytes[2])&&[0x04,0x06,0x08].includes(bytes[3])&&bytes.includes(Buffer.from('[Content_Types].xml'))&&bytes.includes(Buffer.from('ppt/presentation.xml')));
+    if(!validPdf||!validPptx){await discardAttachment(asset).catch(()=>{});fail(`The uploaded file is not a valid ${expected==='.pdf'?'PDF':'PowerPoint file'}.`);}
+    asset.uploadState='complete';delete asset.uploadedBytes;await persist();
+    const {chunks,uploadState,...publicAsset}=asset;return publicAsset;
+  }
   async function cleanupCardImage(upload) {
     const aid=upload.assetId;
     if(!aid||upload.status!=='approved'||upload.extractionState!=='complete'||!db.contacts.some(c=>c.id===upload.contactId&&c.workspace===upload.workspace))return;
@@ -331,13 +394,17 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
     return reviewUpload(upload.id,{action:target?'merge':matches.length?'keep':'save',targetId:target?.id,contact:candidate});
   }
   async function mimeMessage(campaign,recipient) {
-    const boundary=`gather_${id()}`,related=`related_${id()}`;
+    const boundary=`alternative_${id()}`,related=`related_${id()}`,mixed=`mixed_${id()}`;
     const wrap=text=>Buffer.from(text,'utf8').toString('base64').match(/.{1,76}/g)?.join('\r\n')||'';
+    const filename=name=>String(name).replace(/[^\x20-\x7e]/g,'_').replace(/["\\]/g,'_');
+    const disposition=(kind,asset)=>`${kind}; filename="${filename(asset.name)}"; filename*=UTF-8''${encodeURIComponent(asset.name)}`;
     const subject=C.personalise(campaign.subject,recipient),body=C.personalise(campaign.body,recipient);
-    const images=assetsFor(campaign.assetIds);
-    const lines=[`From: ${campaign.sender}`,`To: ${recipient.email}`,`Subject: =?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`,`Message-ID: <${recipient.id}@gather.local>`,'MIME-Version: 1.0',`Content-Type: multipart/related; boundary="${related}"`,'',`--${related}`,`Content-Type: multipart/alternative; boundary="${boundary}"`,'',`--${boundary}`,'Content-Type: text/plain; charset=UTF-8','Content-Transfer-Encoding: base64','',wrap(body),`--${boundary}`,'Content-Type: text/html; charset=UTF-8','Content-Transfer-Encoding: base64','',wrap(`<div style="font-family:Arial,sans-serif;line-height:1.6">${escape(body).replace(/\n/g,'<br>')}${images.map(a=>`<p><img src="cid:${a.id}" alt="${escape(a.name)}" style="max-width:600px;width:100%"></p>`).join('')}</div>`),`--${boundary}--`];
-    for(const asset of images)lines.push(`--${related}`,`Content-Type: ${asset.mime}`,'Content-Transfer-Encoding: base64',`Content-ID: <${asset.id}>`,`Content-Disposition: inline; filename="image-${asset.id}.${asset.mime.split('/')[1]}"`,'',(await readAsset(asset.id)).toString('base64').match(/.{1,76}/g).join('\r\n'));
-    lines.push(`--${related}--`);return Buffer.from(lines.join('\r\n')).toString('base64url');
+    const assets=assetsFor(campaign.assetIds),images=assets.filter(asset=>imageTypes.has(asset.mime)),attachments=assets.filter(asset=>attachmentTypes.has(asset.mime));
+    const lines=[`From: ${campaign.sender}`,`To: ${recipient.email}`,`Subject: =?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`,`Message-ID: <${recipient.id}@gather.local>`,'MIME-Version: 1.0',`Content-Type: multipart/mixed; boundary="${mixed}"`,'',`--${mixed}`,`Content-Type: multipart/related; boundary="${related}"`,'',`--${related}`,`Content-Type: multipart/alternative; boundary="${boundary}"`,'',`--${boundary}`,'Content-Type: text/plain; charset=UTF-8','Content-Transfer-Encoding: base64','',wrap(body),`--${boundary}`,'Content-Type: text/html; charset=UTF-8','Content-Transfer-Encoding: base64','',wrap(`<div style="font-family:Arial,sans-serif;line-height:1.6">${escape(body).replace(/\n/g,'<br>')}${images.map(a=>`<p><img src="cid:${a.id}" alt="${escape(a.name)}" style="max-width:600px;width:100%"></p>`).join('')}</div>`),`--${boundary}--`];
+    for(const asset of images)lines.push(`--${related}`,`Content-Type: ${asset.mime}; name="${filename(asset.name)}"`,'Content-Transfer-Encoding: base64',`Content-ID: <${asset.id}>`,`Content-Disposition: ${disposition('inline',asset)}`,'',(await readAsset(asset.id)).toString('base64').match(/.{1,76}/g).join('\r\n'));
+    lines.push(`--${related}--`);
+    for(const asset of attachments)lines.push(`--${mixed}`,`Content-Type: ${asset.mime}; name="${filename(asset.name)}"`,'Content-Transfer-Encoding: base64',`Content-Disposition: ${disposition('attachment',asset)}`,'',(await readAsset(asset.id)).toString('base64').match(/.{1,76}/g).join('\r\n'));
+    lines.push(`--${mixed}--`);return Buffer.from(lines.join('\r\n'));
   }
   async function sendCampaign(cid) {
     const campaign=db.campaigns.find(c=>c.id===cid)||fail('Campaign not found.',404);
@@ -352,7 +419,8 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
     for(const recipient of campaign.recipients.slice(Math.max(0,firstPending),batchEnd).filter(r=>r.status==='pending')) {
       recipient.status='sending';delete recipient.error;await persist();
       try {
-        const result=await google('gmail','https://gmail.googleapis.com/gmail/v1/users/me/messages/send',{method:'POST',body:JSON.stringify({raw:await mimeMessage(campaign,recipient)})});
+        checkTemplateLimit(campaign.assetIds);
+        const result=await google('gmail','https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=media',{method:'POST',headers:{'content-type':'message/rfc822'},body:await mimeMessage(campaign,recipient)});
         if(!result.id)throw Error('Gmail did not return a message ID. Check Sent before sending again.');
         recipient.status='sent';recipient.messageId=result.id;recipient.sentAt=now();campaign.rateLimitAttempts=0;
       } catch(error) {
@@ -493,9 +561,12 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
       } catch(error) {upload.error=error.message;upload.status='needs_attention';upload.extractionState='failed';upload.automaticRetryPending=body.automatic===true&&upload.automaticAttempts<2;await persist();throw error;}
     }
     if(path==='/api/assets' && method==='POST'){const asset=await assetFile(body);await persist();return respond(asset,201);}
+    if(path==='/api/attachments' && method==='POST')return respond(await startAttachment(body),201);
+    match=path.match(/^\/api\/attachments\/([^/]+)\/(chunks|complete)$/);
+    if(match&&method==='POST')return respond(match[2]==='chunks'?await addAttachmentChunk(match[1],body):await finishAttachment(match[1]));
     if(path==='/api/templates' && method==='POST') {
       workspace(body.workspace);const data={workspace:body.workspace,name:required(body.name,'Template name'),subject:required(body.subject,'Subject'),body:required(body.body,'Message'),assetIds:assetsFor(body.assetIds).map(a=>a.id),updatedAt:now()};
-      if(data.assetIds.reduce((sum,aid)=>sum+db.assets.find(a=>a.id===aid).size,0)>12*1024*1024)fail('Keep the total template images under 12 MB.');
+      checkTemplateLimit(data.assetIds);
       let template=db.templates.find(t=>t.id===body.id && t.workspace===body.workspace);
       if(body.id&&!template)fail('Template not found.',404);
       if(template)Object.assign(template,data);else{template={id:id(),...data};db.templates.push(template);}await persist();return respond(template);
@@ -507,6 +578,7 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
       const contacts=inWorkspace(db.contacts,ws.id).filter(c=>body.audience==='workspace'||(body.contactIds||[]).includes(c.id));
       const recipients=C.recipients(contacts).filter(r=>!body.excludedEmails?.includes(r.email)).map(r=>({...r,id:id(),status:'pending'}));
       if(!recipients.length)fail('Select at least one approved email address.');
+      checkTemplateLimit(template.assetIds);
       const campaign={id:id(),workspace:ws.id,name:required(body.name,'Campaign name'),templateId:template.id,subject:template.subject,body:template.body,assetIds:[...template.assetIds],sender:connection.email,status:'draft',batchSize:C.campaignBatchSize,recipients,createdAt:now()};
       db.campaigns.push(campaign);await persist();return respond(campaign,201);
     }

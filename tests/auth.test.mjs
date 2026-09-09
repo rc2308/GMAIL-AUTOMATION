@@ -59,7 +59,7 @@ test('first visit is setup, all CRM APIs and assets require authentication, setu
   const page=await request('/');assert.match(page.text,/auth-form/);assert.ok(!page.text.includes('src="./app.js"'));
   assert.deepEqual((await request('/api/auth/session')).body,{authenticated:false,setupRequired:true,registrationOpen:true,googleConfigured:true,user:null});
   for(const path of ['/api/state','/api/oauth/google/callback?state=fake','/assets/private-image'])assert.equal((await request(path)).status,401,path);
-  for(const path of ['/api/settings','/api/settings/models','/api/workspaces','/api/contacts','/api/uploads','/api/assets','/api/templates','/api/connect/google','/api/disconnect','/api/import-legacy','/api/campaigns/fake/send'])assert.equal((await request(path,{})).status,401,path);
+  for(const path of ['/api/settings','/api/settings/models','/api/workspaces','/api/contacts','/api/uploads','/api/assets','/api/attachments','/api/templates','/api/connect/google','/api/disconnect','/api/import-legacy','/api/campaigns/fake/send'])assert.equal((await request(path,{})).status,401,path);
   assert.equal((await request('/api/auth/setup',{...owner,password:'short'})).status,400);
   assert.equal((await request('/api/auth/setup',owner,'',{origin:'https://attacker.example'})).status,403);
   assert.equal((await request('/api/auth/setup',owner,'',{'x-gather-client':''})).status,403);

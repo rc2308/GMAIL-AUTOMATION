@@ -26,8 +26,9 @@ export function upstreamMock(){
       if(url.includes(':batchUpdate')){assert.deepEqual(JSON.parse(init.body),{requests:[{addSheet:{properties:{title:'Gather Contacts'}}}]});sheets.set(id,[]);return json({});}
       return json({spreadsheetId:id,properties:{title:'Existing'},sheets:[...sourceTabs.get(id)?.keys()||[],...(sheets.has(id)?['Gather Contacts']:[])].map((title,sheetId)=>({properties:{title,sheetId,gridProperties:{rowCount:Math.max(1,(title==='Gather Contacts'?rows:sourceTabs.get(id).get(title)).length),columnCount:26}}}))});
     }
-    if(url==='https://gmail.googleapis.com/gmail/v1/users/me/messages/send') {
-      sends.push(Buffer.from(JSON.parse(init.body).raw,'base64url').toString());
+    if(url.startsWith('https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=media')) {
+      assert.equal(init.headers['content-type'],'message/rfc822');
+      sends.push(Buffer.from(init.body).toString());
       if(failure)throw Error('Transport lost after submission');
       return json({id:'gmail-message-'+sends.length});
     }

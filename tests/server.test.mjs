@@ -278,6 +278,67 @@ test('Sheets sync, frozen templates, distinct Gmail messages, images and repeat-
   assert.equal(sent.body.subject,'Subject');assert.ok(sent.body.recipients.every(r=>r.messageId&&r.sentAt));
   assert.equal((await request(`/api/campaigns/${campaign.id}/send`,{confirm:true})).status,409);assert.equal(mock.sends.length,2);
 });
+test('templates upload resumable PDF and PPTX attachments and send frozen files through Gmail',async t=>{
+  const mock=upstreamMock(),app=await setup(t,{fetchImpl:mock.fetchImpl,env:{GOOGLE_OAUTH_CLIENT_ID:'test-client',GOOGLE_OAUTH_CLIENT_SECRET:'test-secret',GATHER_TEST:'1'}}),{request,dataDir}=app;
+  await connect(request,'gmail');await connect(request,'sheets');
+  const ws=(await request('/api/workspaces',{name:'Attachments'})).body;await request(`/api/workspaces/${ws.id}/sheet`,{mode:'create'});
+  const contact=(await request('/api/contacts',{workspace:ws.id,business:'Example',emails:['files@example.com']})).body;
+  const pdf=Buffer.concat([Buffer.from('%PDF-1.7\n'),Buffer.alloc(2*1024*1024+17,0x41)]),pptx=Buffer.concat([Buffer.from([0x50,0x4b,0x03,0x04]),Buffer.from('[Content_Types].xml\0ppt/presentation.xml')]);
+  async function upload(name,mime,bytes,{restart=false}={}){
+    const started=await request('/api/attachments',{name,mime,size:bytes.length});assert.equal(started.status,201);
+    assert.equal((await request('/api/state')).body.assets.some(a=>a.id===started.body.id),false);
+    assert.equal((await request('/api/templates',{workspace:ws.id,name:'Incomplete',subject:'S',body:'B',assetIds:[started.body.id]})).status,400);
+    const chunkSize=2*1024*1024;
+    for(let index=0,offset=0;offset<bytes.length;index++,offset+=chunkSize){
+      const data=bytes.subarray(offset,Math.min(offset+chunkSize,bytes.length)).toString('base64');
+      const part=await request(`/api/attachments/${started.body.id}/chunks`,{index,data});assert.equal(part.status,200);
+      if(index===0){assert.equal((await request(`/api/attachments/${started.body.id}/chunks`,{index,data})).status,200);if(restart)await app.restart();}
+    }
+    const complete=await request(`/api/attachments/${started.body.id}/complete`,{});assert.equal(complete.status,200);return complete.body;
+  }
+  const pdfAsset=await upload('proposal final.pdf','application/pdf',pdf,{restart:true});
+  const pptxAsset=await upload('company deck.pptx','application/vnd.openxmlformats-officedocument.presentationml.presentation',pptx);
+  const inline=(await request('/api/assets',image)).body;
+  const state=(await request('/api/state')).body;assert.equal(state.limits.attachmentMB,25);assert.equal(state.limits.attachmentBytes,25_000_000);assert.equal(state.limits.attachmentChunkMB,2);
+  assert.deepEqual(state.assets.filter(a=>[pdfAsset.id,pptxAsset.id].includes(a.id)).map(a=>a.kind),['attachment','attachment']);
+  assert.ok(state.assets.every(a=>a.chunks===undefined&&a.uploadState===undefined));
+  const template=(await request('/api/templates',{workspace:ws.id,name:'Documents',subject:'Requested files',body:'Please see the files.',assetIds:[inline.id,pdfAsset.id,pptxAsset.id]})).body;
+  const campaign=(await request('/api/campaigns',{workspace:ws.id,name:'Files campaign',templateId:template.id,contactIds:[contact.id]})).body;
+  await request('/api/templates',{...template,assetIds:[]});
+  const sent=await request(`/api/campaigns/${campaign.id}/send`,{confirm:true});assert.equal(sent.status,200);assert.equal(sent.body.status,'sent');
+  assert.equal(mock.sends.length,1);const message=mock.sends[0];
+  assert.match(message,/Content-Type: multipart\/mixed/);assert.match(message,/Content-Type: multipart\/related/);
+  assert.match(message,new RegExp(`Content-ID: <${inline.id}>`));assert.match(message,/Content-Disposition: inline/);
+  assert.match(message,/Content-Type: application\/pdf; name="proposal final.pdf"/);assert.match(message,/Content-Disposition: attachment; filename="proposal final.pdf"/);
+  assert.match(message,/Content-Type: application\/vnd\.openxmlformats-officedocument\.presentationml\.presentation; name="company deck.pptx"/);
+  assert.match(message,/Content-Disposition: attachment; filename="company deck.pptx"/);
+  assert.ok(message.includes(pptx.toString('base64')));assert.deepEqual(sent.body.assetIds,[inline.id,pdfAsset.id,pptxAsset.id]);
+  assert.equal(JSON.parse(readFileSync(join(dataDir,'gather.json'),'utf8')).campaigns[0].assetIds.length,3);
+});
+test('attachment validation rejects disguised files, oversized uploads and templates over 25 MB',async t=>{
+  const app=await setup(t),{request,dataDir}=app;
+  const ws=(await request('/api/workspaces',{name:'Attachment limits'})).body;
+  assert.equal((await request('/api/attachments',{name:'wrong.exe',mime:'application/pdf',size:10})).status,400);
+  assert.equal((await request('/api/attachments',{name:'large.pdf',mime:'application/pdf',size:25*1024*1024+1})).status,400);
+  const bad=(await request('/api/attachments',{name:'disguised.pdf',mime:'application/pdf',size:8})).body;
+  await request(`/api/attachments/${bad.id}/chunks`,{index:0,data:Buffer.from('not-pdf!').toString('base64')});
+  assert.equal((await request(`/api/attachments/${bad.id}/complete`,{})).status,400);
+  assert.equal((await request('/api/state')).body.assets.some(asset=>asset.id===bad.id),false);
+  const zip=Buffer.concat([Buffer.from([0x50,0x4b,0x03,0x04]),Buffer.from('ordinary archive')]);
+  const fakeDeck=(await request('/api/attachments',{name:'disguised.pptx',mime:'application/vnd.openxmlformats-officedocument.presentationml.presentation',size:zip.length})).body;
+  await request(`/api/attachments/${fakeDeck.id}/chunks`,{index:0,data:zip.toString('base64')});
+  assert.equal((await request(`/api/attachments/${fakeDeck.id}/complete`,{})).status,400);
+  const stale=(await request('/api/attachments',{name:'abandoned.pdf',mime:'application/pdf',size:5})).body;
+  await request(`/api/attachments/${stale.id}/chunks`,{index:0,data:Buffer.from('%PDF-').toString('base64')});
+  const path=join(dataDir,'gather.json'),before=JSON.parse(readFileSync(path,'utf8')),staleAsset=before.assets.find(asset=>asset.id===stale.id);
+  staleAsset.createdAt='2000-01-01T00:00:00.000Z';writeFileSync(path,JSON.stringify(before));assert.equal(existsSync(join(dataDir,staleAsset.chunks[0].name)),true);
+  await app.restart();assert.equal(existsSync(join(dataDir,staleAsset.chunks[0].name)),false);
+  const db=JSON.parse(readFileSync(path,'utf8'));assert.equal(db.assets.some(asset=>asset.id===stale.id),false);
+  db.assets.push({id:'large-a',name:'a.pdf',mime:'application/pdf',size:13*1024*1024,kind:'attachment'},{id:'large-b',name:'b.pptx',mime:'application/vnd.openxmlformats-officedocument.presentationml.presentation',size:13*1024*1024,kind:'attachment'});
+  writeFileSync(path,JSON.stringify(db));await app.restart();
+  const tooLarge=await request('/api/templates',{workspace:ws.id,name:'Too large',subject:'S',body:'B',assetIds:['large-a','large-b']});
+  assert.equal(tooLarge.status,413);assert.match(tooLarge.body.error,/25 MB/);
+});
 test('uncertain delivery is not labelled sent and cannot be retried automatically',async t=>{
   const mock=upstreamMock();const {request}=await setup(t,{fetchImpl:mock.fetchImpl,env:{GOOGLE_OAUTH_CLIENT_ID:'test-client',GOOGLE_OAUTH_CLIENT_SECRET:'test-secret',GATHER_TEST:'1'}});
   await connect(request,'gmail');await connect(request,'sheets');const ws=(await request('/api/workspaces',{name:'Expo'})).body;await request(`/api/workspaces/${ws.id}/sheet`,{mode:'create'});
@@ -436,7 +497,7 @@ test('Anthropic failures leave cards for attention and reject incomplete model l
 test('hosted campaigns checkpoint sending before Gmail and resume only untouched recipients',async t=>{
   const mock=upstreamMock();let dataDir;
   const fetchImpl=async(url,init)=>{
-    if(url==='https://gmail.googleapis.com/gmail/v1/users/me/messages/send') {
+    if(url.startsWith('https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send')) {
       const db=JSON.parse(readFileSync(join(dataDir,'gather.json'),'utf8'));
       assert.equal(db.campaigns[0].recipients.filter(r=>r.status==='sending').length,1);
     }
@@ -639,7 +700,7 @@ test('bulk audience includes fresh spreadsheet addresses, respects exclusions an
 
 async function batchFixture(t,count,{hosted=false,intercept}={}) {
   const mock=upstreamMock();
-  const app=await setup(t,{fetchImpl:async(url,init)=>url==='https://gmail.googleapis.com/gmail/v1/users/me/messages/send'&&intercept?intercept(url,init,mock):mock.fetchImpl(url,init),
+  const app=await setup(t,{fetchImpl:async(url,init)=>url.startsWith('https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send')&&intercept?intercept(url,init,mock):mock.fetchImpl(url,init),
     env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret',GATHER_TEST:'1',...(hosted?{GATHER_HOSTED:'1'}:{})}});
   const {request}=app;await connect(request,'gmail');await connect(request,'sheets');
   const ws=(await request('/api/workspaces',{name:'Automatic batches'})).body;

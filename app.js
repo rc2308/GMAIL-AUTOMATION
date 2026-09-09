@@ -20,6 +20,9 @@
   const ws=()=>data.workspaces.find(w=>w.id===selected);
   const scoped=(key,wid=selected)=>data[key].filter(r=>r.workspace===wid);
   const asset=aid=>data.assets.find(a=>a.id===aid);
+  const imageMime=mime=>['image/jpeg','image/png','image/webp'].includes(mime);
+  const pptxMime='application/vnd.openxmlformats-officedocument.presentationml.presentation';
+  const bytesLabel=bytes=>bytes>=1024*1024?`${(bytes/1024/1024).toFixed(bytes>=10*1024*1024?1:2)} MB`:`${Math.ceil(bytes/1024)} KB`;
   const pending=(wid=selected)=>scoped('uploads',wid).filter(u=>!['approved','skipped'].includes(u.status));
   const date=value=>value?new Date(value).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'short'}):'—';
   const button=(text,action,kind='secondary',attrs='')=>`<button class="button ${kind}" type="button" data-action="${action}" ${attrs}>${text}</button>`;
@@ -70,7 +73,8 @@
     if(!ws())return requireWorkspace();const templates=scoped('templates');
     if(!templateDraft||templateDraft.workspace!==selected)templateDraft=templates[0]?structuredClone(templates[0]):{workspace:selected,name:'',subject:'',body:'',assetIds:[]};
     const t=templateDraft;
-    return title('Email templates','Write once. Personalise every email. Keep templates separate for each workspace.',button('+ New template','new-template','primary'))+`<div class="templates-layout"><aside class="card template-list"><div class="card-head"><h2>Saved templates <span class="count">${templates.length}</span></h2></div>${templates.map(item=>`<button class="template-list-item ${item.id===t.id?'active':''}" type="button" data-action="select-template" data-id="${item.id}"><span>▤</span><div><strong>${e(item.name)}</strong><small>${e(item.subject)}</small></div></button>`).join('')||'<p class="muted empty-copy">Your saved templates will appear here.</p>'}</aside><form id="template-form" class="card form-card"><div class="editor-heading"><h2>${t.id?'Edit template':'Create a template'}</h2>${badge(t.id?'Saved template':'New template')}</div>${field('Template name','name',t.name,'required placeholder="e.g. Exhibition follow-up"')}${field('Subject','subject',t.subject,'required placeholder="Great meeting your team"')}<label class="field"><span>Message</span><textarea name="body" required rows="11" placeholder="Hello {{contact_name}},">${e(t.body)}</textarea><small>Fields: {{contact_name}}, {{business_name}}, {{email}}. An unassigned name uses the business team as the greeting.</small></label><div class="image-section"><div><strong>Images in your email</strong><p>Images are embedded below your message.</p></div><label class="button secondary upload-label">+ Add images<input id="template-images" type="file" accept="image/jpeg,image/png,image/webp" multiple></label></div><div class="image-strip">${t.assetIds.map(aid=>`<div class="attachment-card"><img src="/assets/${aid}" alt="${e(asset(aid)?.name)}"><span>${e(asset(aid)?.name)}</span>${button('Remove','remove-template-image','text',`data-id="${aid}"`)}</div>`).join('')}</div><div class="form-footer">${button('Preview email','preview-template')}<button class="button primary" type="submit">Save template</button></div></form></div>`;
+    const used=t.assetIds.reduce((sum,aid)=>sum+(asset(aid)?.size||0),0);
+    return title('Email templates','Write once. Personalise every email. Keep templates separate for each workspace.',button('+ New template','new-template','primary'))+`<div class="templates-layout"><aside class="card template-list"><div class="card-head"><h2>Saved templates <span class="count">${templates.length}</span></h2></div>${templates.map(item=>`<button class="template-list-item ${item.id===t.id?'active':''}" type="button" data-action="select-template" data-id="${item.id}"><span>▤</span><div><strong>${e(item.name)}</strong><small>${e(item.subject)}</small></div></button>`).join('')||'<p class="muted empty-copy">Your saved templates will appear here.</p>'}</aside><form id="template-form" class="card form-card"><div class="editor-heading"><h2>${t.id?'Edit template':'Create a template'}</h2>${badge(t.id?'Saved template':'New template')}</div>${field('Template name','name',t.name,'required placeholder="e.g. Exhibition follow-up"')}${field('Subject','subject',t.subject,'required placeholder="Great meeting your team"')}<label class="field"><span>Message</span><textarea name="body" required rows="11" placeholder="Hello {{contact_name}},">${e(t.body)}</textarea><small>Fields: {{contact_name}}, {{business_name}}, {{email}}. An unassigned name uses the business team as the greeting.</small></label><div class="image-section"><div><strong>Email files</strong><p>Images appear in the message. PDFs and PowerPoint files are sent as attachments.</p><small>${bytesLabel(used)} of ${data.limits?.attachmentMB||25} MB used</small></div><label class="button secondary upload-label">+ Add files<input id="template-assets" type="file" accept="image/jpeg,image/png,image/webp,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,.pdf,.pptx" multiple></label></div><div class="image-strip">${t.assetIds.map(aid=>{const a=asset(aid);return `<div class="attachment-card ${imageMime(a?.mime)?'':'attachment-file'}">${imageMime(a?.mime)?`<img src="/assets/${aid}" alt="${e(a?.name)}">`:`<div class="attachment-icon" aria-hidden="true">${a?.mime==='application/pdf'?'PDF':'PPTX'}</div>`}<span title="${e(a?.name)}">${e(a?.name)}</span><small>${bytesLabel(a?.size||0)}</small>${button('Remove','remove-template-asset','text',`data-id="${aid}"`)}</div>`;}).join('')}</div><p class="field-help">Gmail allows up to 25 MB across all attached files. A Google Workspace administrator may set a lower limit.</p><div class="form-footer">${button('Preview email','preview-template')}<button class="button primary" type="submit">Save template</button></div></form></div>`;
   }
   const deliveryFilters=[['all','All messages'],['sent','Sent'],['pending','Pending'],['failed','Failed'],['unknown','Unknown']];
   const deliveryTone=status=>status==='sent'?'':status==='failed'||status==='unknown'?'peach':'gray';
@@ -206,7 +210,7 @@
     if(!recipients.length)return toast('Add contacts with approved email addresses first.',true);excludedEmails.clear();
     modal(all?'Send bulk email':'Compose a campaign',all?'All eligible addresses in this workspace’s Gather Contacts sheet are included. Choose your message below.':'Review the template and choose which addresses should receive an individual email.',`<form id="compose-form" data-audience="${all?'workspace':'selected'}">${field('Campaign name','name','','required placeholder="e.g. September exhibition follow-up"')}<label class="field"><span>Template from ${e(ws().name)}</span><select name="templateId">${scoped('templates').map(t=>`<option value="${t.id}">${e(t.name)}</option>`).join('')}</select></label><div class="recipient-heading"><strong>${recipients.length} unique email addresses</strong><span>From ${e(data.connections.gmail.email)}</span></div><div class="recipient-list">${recipients.map(r=>`<label><input type="checkbox" data-recipient="${e(r.email)}" checked><div><strong>${e(r.email)}</strong><small>${e(r.business||r.name)}</small></div></label>`).join('')}</div><p class="field-help">The spreadsheet is refreshed again before the final preview. Duplicate addresses and excluded emails are skipped. All selected addresses are divided automatically into batches of up to 100. Review the sender, message, and recipients, then confirm once to send every batch. Keep this tab open while sending.</p><div class="modal-actions"><button type="submit" class="button primary">Save draft & preview</button></div></form>`);
   }
-  function emailPreview(t,recipient){const r=recipient||{business:'Example business',email:'contact@example.com'};return `<article class="preview-email"><div class="email-top"><div><strong>To</strong> ${e(r.email)}</div><div><strong>Subject</strong> ${e(C.personalise(t.subject,r))}</div></div><div class="email-content">${e(C.personalise(t.body,r))}</div>${(t.assetIds||[]).map(aid=>`<img class="email-image" src="/assets/${aid}" alt="${e(asset(aid)?.name)}">`).join('')}</article>`;}
+  function emailPreview(t,recipient){const r=recipient||{business:'Example business',email:'contact@example.com'},assets=(t.assetIds||[]).map(asset).filter(Boolean),attachments=assets.filter(a=>!imageMime(a.mime));return `<article class="preview-email"><div class="email-top"><div><strong>To</strong> ${e(r.email)}</div><div><strong>Subject</strong> ${e(C.personalise(t.subject,r))}</div></div><div class="email-content">${e(C.personalise(t.body,r))}</div>${assets.filter(a=>imageMime(a.mime)).map(a=>`<img class="email-image" src="/assets/${a.id}" alt="${e(a.name)}">`).join('')}${attachments.length?`<div class="email-attachments"><strong>${attachments.length} ${attachments.length===1?'attachment':'attachments'}</strong>${attachments.map(a=>`<span><b>${a.mime==='application/pdf'?'PDF':'PPTX'}</b>${e(a.name)} · ${bytesLabel(a.size)}</span>`).join('')}</div>`:''}</article>`;}
   function campaignSummary(c){
     const p=C.campaignProgress(c);
     return `<div class="notice"><strong>${p.total} emails · ${p.totalBatches} ${p.totalBatches===1?'batch':'batches'} of up to ${p.batchSize}</strong><br>${p.sent} sent · ${p.pending} pending · ${p.completedBatches} of ${p.totalBatches} batches complete.${c.status==='waiting'?`<br>Waiting for Gmail. Retry after ${date(c.retryAt)}. ${e(c.pauseMessage||'')}`:''}${['draft','paused','waiting'].includes(c.status)?'<br>One confirmation covers the entire list. Keep this tab open to continue automatically. If you close it, reopen this campaign and resume remaining emails.':''}</div>`;
@@ -220,6 +224,26 @@
     if(file.size>(data.limits?.imageMB||8)*1024*1024)throw Error(`${file.name}: keep each image under ${data.limits?.imageMB||8} MB.`);
     const encoded=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onerror=()=>reject(Error('The image could not be read.'));reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.readAsDataURL(file);});
     return {name:file.name,mime:file.type,data:encoded};
+  }
+  const blobBase64=blob=>new Promise((resolve,reject)=>{const reader=new FileReader();reader.onerror=()=>reject(Error('The file could not be read.'));reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.readAsDataURL(blob);});
+  async function uploadTemplateAssets(files){
+    const list=[...files],limit=data.limits?.attachmentBytes||25_000_000,current=(templateDraft.assetIds||[]).reduce((sum,aid)=>sum+(asset(aid)?.size||0),0);
+    if(current+list.reduce((sum,file)=>sum+file.size,0)>limit)throw Error(`Keep all template files within Gmail’s ${data.limits?.attachmentMB||25} MB attachment limit.`);
+    for(let fileIndex=0;fileIndex<list.length;fileIndex++){
+      const file=list[fileIndex],extension=file.name.toLowerCase().match(/\.[^.]+$/)?.[0],mime=extension==='.pdf'?'application/pdf':extension==='.pptx'?pptxMime:file.type;
+      if(imageMime(mime)){
+        $('#working').textContent=`Uploading ${file.name} · file ${fileIndex+1} of ${list.length}…`;
+        const uploaded=await api('/assets',await imageData(file));templateDraft.assetIds.push(uploaded.id);continue;
+      }
+      if(![['.pdf','application/pdf'],['.pptx',pptxMime]].some(([ext,type])=>extension===ext&&mime===type))throw Error(`${file.name}: use PDF, PPTX, JPEG, PNG, or WebP.`);
+      if(!file.size||file.size>limit)throw Error(`${file.name}: keep each attachment at or below ${data.limits?.attachmentMB||25} MB.`);
+      const upload=await api('/attachments',{name:file.name,mime,size:file.size}),chunkSize=(data.limits?.attachmentChunkMB||2)*1024*1024,total=Math.ceil(file.size/chunkSize);
+      for(let index=0,offset=0;offset<file.size;index++,offset+=chunkSize){
+        $('#working').textContent=`Uploading ${file.name} · part ${index+1} of ${total}…`;
+        await api(`/attachments/${upload.id}/chunks`,{index,data:await blobBase64(file.slice(offset,Math.min(file.size,offset+chunkSize)))});
+      }
+      const finished=await api(`/attachments/${upload.id}/complete`,{});templateDraft.assetIds.push(finished.id);
+    }
   }
   async function uploadFiles(files){
     const target=selected,list=[...files];if(!list.length)return;if(list.length>(data.limits?.maxCardUploads||C.cardUploadLimit))return toast(`Upload up to ${data.limits?.maxCardUploads||C.cardUploadLimit} cards at a time.`,true);
@@ -252,7 +276,7 @@
       case 'test-model':return run(()=>api('/settings/test',{}),'The saved model configuration responded successfully.');
       case 'new-template':templateDraft={workspace:selected,name:'',subject:'',body:'',assetIds:[]};return render();
       case 'select-template':templateDraft=structuredClone(data.templates.find(t=>t.id===target.dataset.id));return render();
-      case 'remove-template-image':templateDraft.assetIds=templateDraft.assetIds.filter(a=>a!==target.dataset.id);return render();
+      case 'remove-template-asset':templateDraft.assetIds=templateDraft.assetIds.filter(a=>a!==target.dataset.id);return render();
       case 'preview-template':return modal('Email preview','Example personalisation. Save your template before composing a campaign.',emailPreview(templateDraft),button('Close','close'));
       case 'review-upload':return reviewUpload(target.dataset.id);
       case 'skip-upload':return run(async()=>{await api(`/uploads/${target.dataset.id}/review`,{action:'skip'});close();},'Card skipped. Its image remains in upload history.');
@@ -320,7 +344,7 @@
     if(el.name==='resolution'){reviewAction=el.value;reviewTarget='';updateDuplicateReview();return;}
     if(el.name==='mergeTarget'){reviewTarget=el.value;updateDuplicateReview();return;}
     if(el.id==='card-files')return uploadFiles(el.files);
-    if(el.id==='template-images'){const files=[...el.files];if(!files.length)return;return run(async()=>{for(const file of files){const image=await api('/assets',await imageData(file));templateDraft.assetIds.push(image.id);}},'Images added to your template draft. Save the template to keep them.');}
+    if(el.id==='template-assets'){const files=[...el.files];if(!files.length)return;return run(()=>uploadTemplateAssets(files),`${files.length} ${files.length===1?'file':'files'} added to your template draft. Save the template to keep them.`);}
     if(el.name==='source'&&el.closest('#copy-form'))$('#copy-form select[name="destination"]').innerHTML=data.workspaces.filter(w=>w.id!==el.value).map(w=>`<option value="${w.id}">${e(w.name)}</option>`).join('');
   });
   document.addEventListener('input',event=>{

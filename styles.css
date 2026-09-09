@@ -37,6 +37,7 @@
 .template-list-item strong,.template-list-item small{overflow-wrap:anywhere}
 .form-footer .button,.modal-actions .button{max-width:100%;white-space:normal;overflow-wrap:anywhere}
 .image-strip,.image-section{min-width:0;max-width:100%}
+.attachment-card>small{display:block;color:var(--muted);font-size:.72rem;margin-top:3px}.attachment-file{display:flex;flex-direction:column;min-height:150px}.attachment-icon{display:grid;place-items:center;height:85px;border-radius:6px;background:#edf3ef;color:var(--forest);font-family:'DM Mono',monospace;font-weight:700;letter-spacing:.06em}.email-attachments{border-top:1px solid var(--line);display:grid;gap:8px;margin-top:20px;padding-top:14px}.email-attachments>span{align-items:center;display:flex;gap:8px}.email-attachments b{background:#edf3ef;border-radius:5px;color:var(--forest);font-family:'DM Mono',monospace;font-size:.72rem;padding:4px 6px}
 #settings-form{container-type:inline-size}
 @container (max-width:520px){#settings-form .split-fields{grid-template-columns:minmax(0,1fr)}}
 @media(max-width:1180px){.settings-layout{grid-template-columns:minmax(0,1fr)}}
