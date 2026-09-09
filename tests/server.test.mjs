@@ -73,8 +73,11 @@ async function connect(request,kind){
 
 test('an existing spreadsheet can be reused across workspaces without changing its source tab',async t=>{
   const mock=upstreamMock(),sheetId='existing-contacts-123';
-  const original=[['Full name','Company','Work emails','Mobile','Notes'],['Alice','Acme','alice@example.com; sales@example.com','+91 9000012345','Source note'],['Bob','Beta','','+91 9000098765',''],['No details','','','','']];
-  mock.sourceTabs.set(sheetId,new Map([["Team's contacts",structuredClone(original)]]));
+  const reordered=[['Expo directory'],[],['Reach at','Organisation / Studio','Attendee'],['Alice <Alice@Example.com>; sales@example.com','Acme Labs','Alice Rao'],['not an email','Ignored','Nobody']];
+  const labelled=[['Company name','Beta Works','email address','sales@beta.example']];
+  const unlabelled=[['hello@gamma-studio.com','Gamma Studio','Nina Shah'],['broken@example','Ignored']];
+  const original=new Map([['Reordered columns',structuredClone(reordered)],['Labels beside values',structuredClone(labelled)],['No headings',structuredClone(unlabelled)]]);
+  mock.sourceTabs.set(sheetId,new Map(original));
   const {request,dataDir}=await setup(t,{fetchImpl:mock.fetchImpl,env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret'}});
   await connect(request,'sheets');
   const other=(await request('/api/workspaces',{name:'Other workspace'})).body;
@@ -82,19 +85,20 @@ test('an existing spreadsheet can be reused across workspaces without changing i
   const local=(await request('/api/contacts',{workspace:target.id,name:'Local',emails:['local@example.com']})).body;
   const linked=await request(`/api/workspaces/${target.id}/sheet`,{mode:'existing',sheetId:`  https://docs.google.com/spreadsheets/d/${sheetId}/edit?usp=sharing#gid=42  `});
   assert.equal(linked.status,200);assert.equal(linked.body.sheetId,sheetId);assert.equal(linked.body.sheetEmail,'sender@example.com');
-  assert.equal(mock.sheets.get(sheetId)[1][0],local.id);
-  const imported=await request(`/api/workspaces/${target.id}/import-sheet`,{tab:"Team's contacts",columns:{name:' Full name ',business:'Company',emails:'work emails',phones:'Mobile',notes:''}});
-  assert.equal(imported.status,200);assert.equal(imported.body.count,2);
+  assert.equal(linked.body.imported,3);assert.equal(linked.body.tabsScanned,3);
   let state=(await request('/api/state')).body;
-  assert.equal(state.contacts.length,1);assert.equal(state.uploads.length,2);
-  assert.ok(state.uploads.every(upload=>upload.workspace===target.id&&upload.status==='review'));
-  assert.deepEqual(state.uploads[0].fields.emails,['alice@example.com','sales@example.com']);
-  assert.equal(state.uploads[0].fields.notes,'');assert.deepEqual(state.uploads[1].fields.phones,['+91 9000098765']);
-  const approved=await request(`/api/uploads/${state.uploads[0].id}/review`,{action:'save',contact:state.uploads[0].fields});
-  assert.equal(approved.status,200);assert.equal(mock.sheets.get(sheetId).length,3);
-  assert.deepEqual(mock.sourceTabs.get(sheetId).get("Team's contacts"),original);
+  assert.equal(state.contacts.length,4);assert.equal(state.uploads.length,0);assert.equal(mock.sheets.get(sheetId).length,5);
+  const alice=state.contacts.find(c=>c.emails.includes('alice@example.com'));
+  assert.deepEqual(alice.emails,['alice@example.com','sales@example.com']);assert.equal(alice.name,'Alice Rao');assert.equal(alice.business,'Acme Labs');
+  const beta=state.contacts.find(c=>c.emails.includes('sales@beta.example'));
+  assert.equal(beta.name,'');assert.equal(beta.business,'Beta Works');
+  const nina=state.contacts.find(c=>c.emails.includes('hello@gamma-studio.com'));
+  assert.equal(nina.name,'Nina Shah');assert.equal(nina.business,'Gamma Studio');
+  assert.deepEqual(mock.sourceTabs.get(sheetId),original);
+  const rescanned=await request(`/api/workspaces/${target.id}/import-sheet`,{automatic:true});
+  assert.equal(rescanned.status,200);assert.equal(rescanned.body.imported,0);assert.equal((await request('/api/state')).body.contacts.length,4);
   const reused=await request(`/api/workspaces/${other.id}/sheet`,{mode:'existing',sheetId});
-  assert.equal(reused.status,200);assert.equal(reused.body.sheetId,sheetId);
+  assert.equal(reused.status,200);assert.equal(reused.body.sheetId,sheetId);assert.equal(reused.body.imported,0);
   state=(await request('/api/state')).body;
   assert.deepEqual(state.contacts.filter(c=>c.workspace===other.id).map(c=>c.id).sort(),state.contacts.filter(c=>c.workspace===target.id).map(c=>c.id).sort());
   await request('/api/contacts',{workspace:other.id,name:'Shared contact',emails:['shared@example.com']});

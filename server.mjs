@@ -250,10 +250,89 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
         await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${sid}:batchUpdate`,{method:'POST',body:JSON.stringify({requests:[{addSheet:{properties:{title:'Gather Contacts'}}}]})});
       }
     }
-    ws.sheetId=sheet.spreadsheetId;ws.sheetName=sheet.properties.title;ws.sheetEmail=db.connections.sheets.email;ws.syncError='';await persist();await autoSyncWorkspace(wid);return ws;
+    ws.sheetId=sheet.spreadsheetId;ws.sheetName=sheet.properties.title;ws.sheetEmail=db.connections.sheets.email;ws.syncError='';await persist();await autoSyncWorkspace(wid);
+    const imported=body.mode==='existing'?await autoImportSheet(wid,sheet.sheets):{imported:0,updated:0,tabsScanned:0};
+    return {...ws,...imported};
   }
   const sheetHeaders=['Gather ID','Contact name','Business','Role','Email addresses','Phone numbers','Notes','Excluded emails'];
   const sheetRow = c => [c.id,c.name,c.business,c.role,c.emails.join('; '),c.phones.join('; '),c.notes||'',(c.excludedEmails||[]).join('; ')];
+  const freeMailDomains=new Set(['gmail.com','googlemail.com','yahoo.com','yahoo.co.in','outlook.com','hotmail.com','live.com','icloud.com','me.com','aol.com','proton.me','protonmail.com','zoho.com','rediffmail.com']);
+  const companyWords=/\b(?:agency|associates|brand|company|consulting|corp(?:oration)?|digital|enterprises?|firm|foundation|group|hospital|hotel|inc(?:orporated)?|industries|institute|labs?|limited|llc|llp|ltd|pvt|school|solutions?|studio|technologies|university)\b/i;
+  const normalizedLabel=value=>String(value??'').trim().toLowerCase().replace(/[_/\\-]+/g,' ').replace(/[^\p{L}\p{N} ]/gu,'').replace(/\s+/g,' ');
+  function headerKind(value) {
+    const label=normalizedLabel(value);if(!label||label.length>45)return '';
+    if(/^(?:(?:work|contact|primary|business) )?e ?mail(?: id| address| addresses)?$/.test(label))return 'emails';
+    if(/^(?:business|business name|company|company name|organisation|organization|organisation name|organization name|firm|brand|studio|employer)$/.test(label))return 'business';
+    if(/^(?:name|full name|contact|contact name|contact person|person|person name|customer|customer name|client|client name|representative|attendee)$/.test(label))return 'name';
+    return '';
+  }
+  function emailsIn(value) {
+    const found=String(value??'').match(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+/gi)||[];
+    return [...new Set(found.map(C.email).filter(C.validEmail))];
+  }
+  const readableText=value=>{
+    const text=String(value??'').trim();
+    return text&&text.length<=160&&!emailsIn(text).length&&!headerKind(text)&&!/^https?:\/\//i.test(text)&&!/^[-+()\d\s./:]+$/.test(text)?text:'';
+  };
+  function headerMap(rows,rowIndex) {
+    for(let index=rowIndex-1;index>=Math.max(0,rowIndex-30);index--) {
+      const map={};for(let column=0;column<rows[index].length;column++){const kind=headerKind(rows[index][column]);if(kind&&!Object.hasOwn(map,kind))map[kind]=column;}
+      if(Object.keys(map).length>=2||map.emails)return map;
+      if(index<rowIndex-1&&rows[index].some(value=>emailsIn(value).length))break;
+    }
+    return {};
+  }
+  function labelledValue(rows,rowIndex,kind) {
+    for(let index=rowIndex;index>=Math.max(0,rowIndex-6);index--) {
+      const row=rows[index];if(index<rowIndex&&!row.some(value=>String(value??'').trim()))break;
+      for(let column=0;column<row.length;column++)if(headerKind(row[column])===kind) {
+        for(const value of [row[column+1],index<rowIndex?rows[index+1]?.[column]:undefined]) {
+          const text=readableText(value);if(text)return text;
+        }
+      }
+    }
+    return '';
+  }
+  function businessFromEmail(email) {
+    const domain=email.split('@')[1]||'';if(!domain||freeMailDomains.has(domain))return '';
+    const labels=domain.split('.').filter(label=>!['www','mail','email','contact','com','co','org','net','edu','ac','gov','in','uk'].includes(label));
+    const label=labels.at(-1)||'';return label.replace(/[-_]+/g,' ').replace(/\b\w/g,letter=>letter.toUpperCase());
+  }
+  function inferredContact(rows,rowIndex) {
+    const row=rows[rowIndex]||[],emails=[...new Set(row.flatMap(emailsIn))];if(!emails.length)return null;
+    const map=headerMap(rows,rowIndex);
+    let name=readableText(row[map.name])||labelledValue(rows,rowIndex,'name');
+    let business=readableText(row[map.business])||labelledValue(rows,rowIndex,'business');
+    const candidates=row.map(readableText).filter(Boolean).filter(value=>value!==name&&value!==business);
+    const domainKey=(emails[0].split('@')[1]||'').split('.').filter(part=>!['com','co','org','net','edu','ac','gov','in','uk'].includes(part)).at(-1)?.replace(/[^a-z0-9]/gi,'').toLowerCase()||'';
+    const businessScore=value=>(companyWords.test(value)?4:0)+(domainKey&&normalizedLabel(value).replace(/[^a-z0-9]/g,'').includes(domainKey)?5:0);
+    const personScore=value=>{const words=value.split(/\s+/).filter(Boolean);return !companyWords.test(value)&&words.length>=2&&words.length<=5&&words.every(word=>/^[\p{L}.'-]+$/u.test(word))?3:0;};
+    if(!business&&candidates.length){const ranked=[...candidates].sort((a,b)=>businessScore(b)-businessScore(a));if(businessScore(ranked[0])>0||candidates.length===1&&personScore(candidates[0])===0)business=ranked[0];}
+    if(!name){const choices=candidates.filter(value=>value!==business).sort((a,b)=>personScore(b)-personScore(a));if(choices.length&&(personScore(choices[0])>0||candidates.length>1))name=choices[0];}
+    if(!business){const remaining=candidates.find(value=>value!==name);business=remaining||businessFromEmail(emails[0]);}
+    return C.contact({name,business,emails});
+  }
+  async function autoImportSheet(wid,knownSheets) {
+    const ws=workspace(wid);if(!ws.sheetId)fail('Connect a spreadsheet first.');
+    if(db.connections.sheets?.email!==ws.sheetEmail)fail('Reconnect the Google Sheets account that owns this workspace.',409);
+    const metadata=knownSheets?{sheets:knownSheets}:await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${ws.sheetId}?fields=sheets.properties`);
+    const titles=(metadata.sheets||[]).map(sheet=>sheet.properties||{}).filter(properties=>properties.title&&properties.title!=='Gather Contacts'&&(!properties.sheetType||properties.sheetType==='GRID')).map(properties=>properties.title);
+    let imported=0,updated=0,tabsScanned=0;const skippedTabs=[];
+    for(const title of titles) {
+      const tab=title.replaceAll("'","''");let rows;
+      try{rows=(await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${ws.sheetId}/values/${encodeURIComponent(`'${tab}'!A1:ZZ10000`)}`)).values||[];tabsScanned++;}
+      catch{skippedTabs.push(title);continue;}
+      for(let index=0;index<rows.length;index++) {
+        const candidate=inferredContact(rows,index);if(!candidate)continue;
+        const matches=inWorkspace(db.contacts,wid).filter(contact=>contact.emails.some(email=>candidate.emails.includes(email)));
+        if(matches.length) {
+          const current=matches[0],before=JSON.stringify(C.contact(current)),merged=C.merge(current,candidate);
+          if(JSON.stringify(C.contact(merged))!==before){Object.assign(current,merged,{dirty:true});updated++;}
+        } else {db.contacts.push({...candidate,id:id(),workspace:wid,dirty:true});imported++;}
+      }
+    }
+    await persist();await autoSyncWorkspace(wid);return {imported,updated,tabsScanned,skippedTabs};
+  }
   async function readSheet(wid) {
     const ws=workspace(wid);if(!ws.sheetId)fail('Connect this workspace to a spreadsheet first.',409);
     if(db.connections.sheets?.email!==ws.sheetEmail)fail('Reconnect the Google Sheets account that owns this workspace.',409);
@@ -422,6 +501,7 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
       const [ ,wid,action]=match;
       if(action==='sheet')return respond(await bindSheet(wid,body));
       if(action==='sync')return respond(await syncSheet(wid));
+      if(body.automatic===true)return respond(await autoImportSheet(wid));
       const ws=workspace(wid);if(!ws.sheetId)fail('Connect a spreadsheet first.');
       if(db.connections.sheets?.email!==ws.sheetEmail)fail('Reconnect the Google Sheets account that owns this workspace.',409);
       const tab=required(body.tab,'Tab name').replaceAll("'","''");
