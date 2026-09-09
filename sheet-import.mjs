@@ -2,7 +2,7 @@ import {randomUUID} from 'node:crypto';
 import './core.js';
 
 const C=globalThis.GatherCore;
-export const SHEET_IMPORT_VERSION=2;
+export const SHEET_IMPORT_VERSION=3;
 const text=value=>String(value??'').trim();
 const unique=values=>[...new Set(values)];
 const label=value=>text(value).toLowerCase().replace(/[_/\\-]+/g,' ').replace(/[^\p{L}\p{N} ]/gu,'').replace(/\s+/g,' ');

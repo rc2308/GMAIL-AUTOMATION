@@ -505,23 +505,7 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
       const [ ,wid,action]=match;
       if(action==='sheet')return respond(await bindSheet(wid,body));
       if(action==='sync')return respond(await syncSheet(wid));
-      if(body.automatic===true)return respond(await sheetImporter.step(workspace(wid),{jobId:body.jobId,restart:body.restart===true}));
-      const ws=workspace(wid);if(!ws.sheetId)fail('Connect a spreadsheet first.');
-      if(db.connections.sheets?.email!==ws.sheetEmail)fail('Reconnect the Google Sheets account that owns this workspace.',409);
-      const tab=required(body.tab,'Tab name').replaceAll("'","''");
-      const result=await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${ws.sheetId}/values/${encodeURIComponent(`'${tab}'!A1:Z10000`)}`);
-      const rows=result.values||[];const headers=(rows[0]||[]).map(v=>String(v).trim().toLowerCase());
-      const column=name=>{const header=String(body.columns?.[name]??name).trim().toLowerCase();return header?headers.indexOf(header):-1;};
-      if(column('emails')<0 && column('phones')<0)fail('Map at least the email or phone column to an existing header.');
-      const imported=[];
-      for(let index=1;index<rows.length;index++) {
-        let fields;
-        try{fields=C.contact(Object.fromEntries(['name','business','role','emails','phones','notes'].map(k=>[k,rows[index][column(k)]??''])));}
-        catch(error){fail(`Row ${index+1}: ${error.message} No rows were imported.`);}
-        if(!fields.emails.length&&!fields.phones.length)continue;
-        imported.push({id:id(),workspace:ws.id,filename:`Imported row ${index+1}`,status:'review',fields,createdAt:now()});
-      }
-      db.uploads.push(...imported);await persist();return respond({count:imported.length});
+      return respond(await sheetImporter.step(workspace(wid),{jobId:body.jobId,restart:body.restart===true}));
     }
     if(path==='/api/contacts' && method==='POST'){const row=saveContact(body.workspace,body,body.id);await persist();await autoSyncWorkspace(body.workspace);return respond(row);}
     if(path==='/api/copy' && method==='POST') {

@@ -4,6 +4,7 @@ import {mkdtempSync,readFileSync,writeFileSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createGather} from '../server.mjs';
+import {SHEET_IMPORT_VERSION} from '../sheet-import.mjs';
 import {json,upstreamMock} from './fixtures/upstreams.mjs';
 
 const pixel='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jK1sAAAAASUVORK5CYII=';
@@ -184,22 +185,20 @@ test('bad sheet links and denied Google access leave the workspace available for
   assert.equal((await request('/api/state')).body.workspaces.length,1);
 });
 
-test('invalid imported rows fail together, and correcting the source allows a clean retry',async t=>{
-  const mock=upstreamMock(),sheetId='existing-invalid-123';
-  mock.sourceTabs.set(sheetId,new Map([['Contacts',[['Name','Email'],['Good','good@example.com'],['Bad','not-an-email']]]]));
-  const {request,dataDir}=await setup(t,{fetchImpl:mock.fetchImpl,env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret'}});
-  await connect(request,'sheets');const ws=(await request('/api/workspaces',{name:'Import retry'})).body;
-  await request(`/api/workspaces/${ws.id}/sheet`,{mode:'existing',sheetId});
-  const input={tab:'Contacts',columns:{name:'Name',emails:'Email',phones:''}};
-  const invalid=await request(`/api/workspaces/${ws.id}/import-sheet`,input);assert.equal(invalid.status,400);assert.match(invalid.body.error,/Row 3:.*No rows were imported/);
-  assert.equal((await request('/api/state')).body.uploads.length,0);assert.equal(JSON.parse(readFileSync(join(dataDir,'gather.json'),'utf8')).uploads.length,0);
-  assert.equal((await request(`/api/workspaces/${ws.id}/import-sheet`,{...input,columns:{emails:'',phones:''}})).status,400);
-  assert.ok((await request(`/api/workspaces/${ws.id}/import-sheet`,{...input,tab:'Missing'})).status>=400);
-  mock.sourceTabs.get(sheetId).get('Contacts')[2][1]='fixed@example.com';
-  const retried=await request(`/api/workspaces/${ws.id}/import-sheet`,input);assert.equal(retried.status,200);assert.equal(retried.body.count,2);
-  assert.equal((await request('/api/state')).body.uploads.length,2);
+test('every linked-sheet import request uses the dynamic resumable reader beyond row 10000',async t=>{
+  const mock=upstreamMock(),sheetId='existing-dynamic-123',rows=Array.from({length:10002},()=>[]);
+  rows[0]=['Name','Business','Email'];rows[10001]=['Last Person','Last Business','last@example.com'];
+  mock.sourceTabs.set(sheetId,new Map([['Contacts',rows]]));
+  const {request}=await setup(t,{fetchImpl:mock.fetchImpl,env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret'}});
+  await connect(request,'sheets');const ws=(await request('/api/workspaces',{name:'Dynamic import'})).body;
+  const linked=await request(`/api/workspaces/${ws.id}/sheet`,{mode:'existing',sheetId});assert.equal(linked.status,200);
+  const legacyShape=await request(`/api/workspaces/${ws.id}/import-sheet`,{tab:'Contacts',columns:{name:'Name',business:'Business',emails:'Email'}});
+  assert.equal(legacyShape.status,200);assert.equal(legacyShape.body.jobId,linked.body.jobId);assert.equal(legacyShape.body.version,SHEET_IMPORT_VERSION);
+  const done=await finishImport(request,ws.id);assert.equal(done.finished,true);assert.ok(done.rowsScanned>10000);
+  const state=(await request('/api/state')).body,contact=state.contacts.find(row=>row.emails.includes('last@example.com'));
+  assert.equal(contact.name,'Last Person');assert.equal(contact.business,'Last Business');assert.equal(state.uploads.length,0);
   await request('/api/disconnect',{kind:'sheets'});
-  assert.equal((await request(`/api/workspaces/${ws.id}/import-sheet`,input)).status,409);
+  assert.equal((await request(`/api/workspaces/${ws.id}/import-sheet`,{})).status,409);
 });
 
 test('separate workspaces, templates and copied contacts persist across restart',async t=>{
