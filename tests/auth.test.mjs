@@ -4,6 +4,7 @@ import {mkdtempSync, readFileSync, writeFileSync, rmSync, statSync} from 'node:f
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createGather} from '../server.mjs';
+import {upstreamMock} from './fixtures/upstreams.mjs';
 
 const owner={name:'Owner',email:'owner@example.com',password:'a long test passphrase'};
 async function setup(t, options={}) {
@@ -27,6 +28,31 @@ async function setup(t, options={}) {
   }
   return {...await start(),dataDir,start};
 }
+
+test('spreadsheet jobs and provider credentials remain isolated even when accounts link the same sheet',async t=>{
+  const mock=upstreamMock();mock.sourceTabs.set('shared-source-123',new Map([['Contacts',[['hello@example.com','Velvet Kite']]]]));
+  const {request}=await setup(t,{fetchImpl:mock.fetchImpl});
+  const first=await request('/api/auth/setup',owner),second=await request('/api/auth/register',{name:'Member',email:'member@example.com',password:'another long test passphrase'});
+  const jobs=[],workspaces=[];
+  for(const login of [first,second]){
+    const start=await request('/api/connect/google',{kind:'sheets'},login.cookie),state=new URL(start.body.url).searchParams.get('state');
+    assert.equal((await request(`/api/oauth/google/callback?state=${state}&code=sheets`,undefined,login.cookie+'; '+start.cookie)).status,303);
+    const w=(await request('/api/workspaces',{name:'Private workspace'},login.cookie)).body;workspaces.push(w);
+    const linked=await request(`/api/workspaces/${w.id}/sheet`,{mode:'existing',sheetId:'shared-source-123'},login.cookie);jobs.push(linked.body.jobId);
+  }
+  assert.notEqual(jobs[0],jobs[1]);
+  await request('/api/settings',{provider:'anthropic',model:'private-choice',apiKey:'owner-private-key',enabled:false},first.cookie);
+  assert.equal((await request(`/api/workspaces/${workspaces[0].id}/import-sheet`,{automatic:true,jobId:jobs[0]},second.cookie)).status,404);
+  assert.equal((await request(`/api/workspaces/${workspaces[1].id}/import-sheet`,{automatic:true,jobId:jobs[0]},second.cookie)).status,404);
+  for(let i=0;i<12;i++){
+    const r=await request(`/api/workspaces/${workspaces[1].id}/import-sheet`,{automatic:true,jobId:jobs[1]},second.cookie);
+    assert.equal(r.status,200);if(r.body.status==='waiting'){assert.match(r.body.error,/API key/);break;}
+  }
+  const member=(await request('/api/state',undefined,second.cookie)).body,ownerState=(await request('/api/state',undefined,first.cookie)).body;
+  assert.equal(member.settings.hasKey,false);assert.equal(member.settings.model,'');assert.equal(member.workspaces.length,1);assert.equal(member.contacts.length,1);
+  assert.ok(!JSON.stringify(member).includes(jobs[0]));assert.ok(!JSON.stringify(member).includes('private-choice'));
+  assert.equal(ownerState.workspaces[0].sheetImport.jobId,jobs[0]);assert.equal(ownerState.workspaces[0].sheetImport.phase,'repair');
+});
 
 test('first visit is setup, all CRM APIs and assets require authentication, setup preserves data',async t=>{
   const {request,dataDir}=await setup(t);

@@ -4,6 +4,7 @@ import {mkdtempSync,readFileSync,writeFileSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createGather} from '../server.mjs';
+import {json,upstreamMock} from './fixtures/upstreams.mjs';
 
 const pixel='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jK1sAAAAASUVORK5CYII=';
 const image={name:'test-card.png',mime:'image/png',data:pixel};
@@ -29,47 +30,105 @@ async function setup(t,options={}) {
     if(options.env?.GATHER_HOSTED==='1')options.env.GATHER_PUBLIC_ORIGIN=base.replace('http:','https:');
   }};
 }
-const json=(value,status=200)=>new Response(JSON.stringify(value),{status,headers:{'content-type':'application/json'}});
-function upstreamMock(){
-  let counter=0,scope='',sends=[],failure=false;const sheets=new Map(),sourceTabs=new Map();
-  const fetchImpl=async(url,init={})=>{
-    if(url==='https://oauth2.googleapis.com/token') {
-      const form=new URLSearchParams(init.body);scope=form.get('code');
-      return json({access_token:'access-'+scope,refresh_token:'refresh-'+scope,expires_in:3600,scope:`openid email https://www.googleapis.com/auth/${scope==='gmail'?'gmail.send':'spreadsheets'}`});
-    }
-    if(url==='https://openidconnect.googleapis.com/v1/userinfo')return json({email:'sender@example.com',email_verified:true});
-    if(url==='https://sheets.googleapis.com/v4/spreadsheets'){
-      const id='spreadsheet-'+(++counter);sheets.set(id,[]);return json({spreadsheetId:id,properties:{title:JSON.parse(init.body).properties.title},sheets:[{properties:{title:'Gather Contacts'}}]});
-    }
-    if(url.includes('sheets.googleapis.com')){
-      const path=new URL(url).pathname,id=path.split('/spreadsheets/')[1].split('/')[0].split(':')[0],rows=sheets.get(id)||[];
-      if(url.includes('values:batchUpdate')) {
-        for(const item of JSON.parse(init.body).data){const index=Number(item.range.match(/!A(\d+)/)[1])-1;item.values.forEach((row,i)=>{rows[index+i] ||= [];row.forEach((value,column)=>{rows[index+i][column]=value;});});}sheets.set(id,rows);return json({});
-      }
-      if(url.includes(':append')){rows.push(...JSON.parse(init.body).values);sheets.set(id,rows);return json({});}
-      if(url.includes('/values/')){
-        const tab=decodeURIComponent(path.split('/values/')[1]).match(/^'(.*)'!/)?.[1].replaceAll("''","'");
-        if(tab!=='Gather Contacts')return sourceTabs.get(id)?.has(tab)?json({values:sourceTabs.get(id).get(tab)}):json({error:{message:'Source tab not found'}},400);
-        return json({values:rows});
-      }
-      if(url.includes(':batchUpdate')){assert.deepEqual(JSON.parse(init.body),{requests:[{addSheet:{properties:{title:'Gather Contacts'}}}]});sheets.set(id,[]);return json({});}
-      return json({spreadsheetId:id,properties:{title:'Existing'},sheets:[...sourceTabs.get(id)?.keys()||[],...(sheets.has(id)?['Gather Contacts']:[])].map(title=>({properties:{title}}))});
-    }
-    if(url==='https://gmail.googleapis.com/gmail/v1/users/me/messages/send') {
-      sends.push(Buffer.from(JSON.parse(init.body).raw,'base64url').toString());
-      if(failure)throw Error('Transport lost after submission');
-      return json({id:'gmail-message-'+sends.length});
-    }
-    if(url.includes('generativelanguage.googleapis.com'))return json({candidates:[{content:{parts:[{text:JSON.stringify({name:'Person',business:'Example business',role:'Director',emails:['one@example.com','two@example.com'],phones:['+91 9000012345','+91 9000054321']})}]}}]});
-    throw Error('Unexpected upstream URL: '+url);
-  };
-  return {fetchImpl,sheets,sourceTabs,sends,setFailure:()=>failure=true};
-}
 async function connect(request,kind){
   const start=await request('/api/connect/google',{kind});assert.equal(start.status,200);
   const state=new URL(start.body.url).searchParams.get('state');const cookie=start.headers.get('set-cookie').split(';')[0];
   const callback=await request(`/api/oauth/google/callback?state=${state}&code=${kind}`,undefined,{headers:{cookie}});assert.equal(callback.status,303);
 }
+async function finishImport(request,wid,options={}){
+  let result;
+  for(let i=0;i<300;i++){
+    result=await request(`/api/workspaces/${wid}/import-sheet`,{automatic:true,...(i===0?options:{})});
+    assert.equal(result.status,200,JSON.stringify(result.body));
+    if(result.body.finished||result.body.status==='waiting')return result.body;
+  }
+  throw Error('Import did not finish');
+}
+
+for(const provider of ['anthropic','gemini','compatible'])test(`${provider} spreadsheet assistance uses the selected model and saved key with card extraction disabled`,async t=>{
+  const mock=upstreamMock();let modelCalls=0;
+  mock.sourceTabs.set('clear-contacts-123',new Map([['Contacts',[['Business','Email address'],['Aster & Alloy','clear@example.com']]]]));
+  mock.sourceTabs.set('unclear-contacts-123',new Map([['Contacts',[['hello@example.com','Velvet Kite','Priya Rao']]]]));
+  const {request,dataDir}=await setup(t,{env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret'},fetchImpl:async(url,init)=>{
+    if(!/api.anthropic.com|generativelanguage.googleapis.com|compatible.example/.test(url))return mock.fetchImpl(url,init);
+    modelCalls++;const body=JSON.parse(init.body);
+    assert.equal(init.headers[provider==='anthropic'?'x-api-key':provider==='gemini'?'x-goog-api-key':'authorization'],provider==='compatible'?'Bearer private-test-key':'private-test-key');
+    if(provider==='gemini')assert.ok(url.includes('models/selected-test-model:generateContent'));else assert.equal(body.model,'selected-test-model');
+    const prompt=provider==='gemini'?body.contents[0].parts[0].text:body.messages[0].content[0].text;
+    if(modelCalls===1)return json({error:{message:'Temporary provider failure'}},503);
+    const records=JSON.parse(prompt.slice(prompt.indexOf('\n')+1));assert.equal(records.length,1);
+    const output=JSON.stringify({records:records.map(r=>({key:r.key,business:r.cells.find(c=>c.text==='Velvet Kite'),name:r.cells.find(c=>c.text==='Priya Rao'),emails:['invented@example.com']}))});
+    return json(provider==='anthropic'?{content:[{type:'text',text:output}]}:provider==='gemini'?{candidates:[{content:{parts:[{text:output}]}}]}:{choices:[{message:{content:output}}]});
+  }});
+  await request('/api/settings',{provider,model:'selected-test-model',apiKey:'private-test-key',baseUrl:provider==='compatible'?'https://compatible.example/v1':'',enabled:false});
+  await connect(request,'sheets');
+  const clear=(await request('/api/workspaces',{name:'Clear table'})).body;
+  await request(`/api/workspaces/${clear.id}/sheet`,{mode:'existing',sheetId:'clear-contacts-123'});
+  assert.equal((await finishImport(request,clear.id)).finished,true);assert.equal(modelCalls,0);
+  const unclear=(await request('/api/workspaces',{name:'Unclear table'})).body;
+  await request(`/api/workspaces/${unclear.id}/sheet`,{mode:'existing',sheetId:'unclear-contacts-123'});
+  assert.equal((await finishImport(request,unclear.id)).finished,true);assert.equal(modelCalls,2);
+  const state=(await request('/api/state')).body,c=state.contacts.find(c=>c.workspace===unclear.id);
+  assert.equal(c.business,'Velvet Kite');assert.equal(c.name,'Priya Rao');assert.deepEqual(c.emails,['hello@example.com']);
+  assert.equal(state.sheetImportJobs,undefined);assert.ok(!JSON.stringify(state).includes('private-test-key'));
+  assert.ok(!readFileSync(join(dataDir,'gather.json'),'utf8').includes('private-test-key'));
+});
+
+test('provider errors keep emails durable and resume after configuration changes without accepting invented names',async t=>{
+  const mock=upstreamMock();let mode='malformed',calls=0;
+  mock.sourceTabs.set('unclear-failures-123',new Map([['Contacts',[['hello@example.com','Velvet Kite']]]]));
+  const app=await setup(t,{env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret'},fetchImpl:async(url,init)=>{
+    if(!url.includes('api.anthropic.com'))return mock.fetchImpl(url,init);
+    calls++;if(mode==='denied')return json({error:{message:'Invalid provider API key. Update Settings.'}},401);
+    const prompt=JSON.parse(init.body).messages[0].content[0].text,[r]=JSON.parse(prompt.slice(prompt.indexOf('\n')+1));
+    const output=mode==='malformed'?'not json':JSON.stringify({records:[{key:r.key,name:null,business:{row:1,col:2,text:mode==='invented'?'Invented Company':'Velvet Kite'}}]});
+    return json({content:[{type:'text',text:output}]});
+  }});
+  const {request}=app;await connect(request,'sheets');
+  const ws=(await request('/api/workspaces',{name:'Resumable errors'})).body;
+  await request(`/api/workspaces/${ws.id}/sheet`,{mode:'existing',sheetId:'unclear-failures-123'});
+  assert.equal((await finishImport(request,ws.id)).status,'waiting');assert.equal(calls,0);
+  for(const failure of ['malformed','invented','denied']){
+    mode=failure;await request('/api/settings',{provider:'anthropic',model:'chosen',apiKey:'test-key',enabled:false});
+    const before=calls,result=await finishImport(request,ws.id);
+    assert.equal(result.status,'waiting');assert.equal(result.pending,1);assert.equal(calls-before,1);
+    const state=(await request('/api/state')).body;assert.deepEqual(state.contacts[0].emails,['hello@example.com']);assert.equal(state.contacts[0].business,'');
+    await app.restart();assert.equal((await request('/api/state')).body.workspaces[0].sheetImport.jobId,result.jobId);
+  }
+  mode='valid';await request('/api/settings',{provider:'anthropic',model:'chosen',apiKey:'replacement',enabled:false});
+  const done=await finishImport(request,ws.id);assert.equal(done.finished,true);assert.equal(done.pending,0);
+  assert.equal((await request('/api/state')).body.contacts[0].business,'Velvet Kite');
+});
+
+test('repair keeps managed IDs, exclusions and frozen campaign snapshots, and bounds sync writes',async t=>{
+  const mock=upstreamMock(),sheetId='repair-existing-123',headers=['Gather ID','Contact name','Business','Role','Email addresses','Phone numbers','Notes','Excluded emails'];
+  const original=[['Business','Email'],...Array.from({length:405},(_,i)=>[`Studio ${i}`,`p${i}@example.com`])];
+  mock.sourceTabs.set(sheetId,new Map([['Source',original]]));
+  mock.sheets.set(sheetId,[headers,...original.slice(1).map((r,i)=>[`stored-${i}`,'','Role','',r[1],'+91 9999999999','Keep notes',i===0?r[1]:''])]);
+  const app=await setup(t,{env:{GOOGLE_OAUTH_CLIENT_ID:'client',GOOGLE_OAUTH_CLIENT_SECRET:'secret'},fetchImpl:async(url,init)=>{
+    if(url.includes('values:batchUpdate'))assert.ok(JSON.parse(init.body).data.length<=200);
+    return mock.fetchImpl(url,init);
+  }});
+  const {request,dataDir}=app;await connect(request,'sheets');
+  const ws=(await request('/api/workspaces',{name:'Old workspace'})).body;
+  // Seed the shape left by the previous production importer, before any new job exists.
+  const path=join(dataDir,'gather.json'),db=JSON.parse(readFileSync(path,'utf8'));
+  Object.assign(db.workspaces[0],{sheetId,sheetEmail:'sender@example.com'});
+  db.contacts=mock.sheets.get(sheetId).slice(1).map(r=>({id:r[0],workspace:ws.id,name:r[1],business:r[2],role:r[3],emails:[r[4]],phones:[r[5]],notes:r[6],excludedEmails:r[7]?[r[7]]:[],dirty:false}));
+  db.campaigns=[{id:'sent-campaign',workspace:ws.id,status:'sent',recipients:[{id:'delivery',contactId:'stored-1',email:'p1@example.com',business:'Role',status:'sent',gmailId:'already-sent',sentAt:'2026-09-09T08:30:00Z'}]}];
+  const history=structuredClone(db.campaigns);writeFileSync(path,JSON.stringify(db));await app.restart();
+  // Missing managed IDs must recover by unique email without oversized writes.
+  mock.sheets.get(sheetId).slice(100,350).forEach(row=>row[0]='');
+  const first=await request(`/api/workspaces/${ws.id}/import-sheet`,{automatic:true});
+  assert.equal(first.body.needsContinuation,true);assert.equal((await request(`/api/workspaces/${ws.id}/sync`,{})).status,409);
+  await app.restart();assert.equal((await finishImport(request,ws.id,{jobId:first.body.jobId})).finished,true);
+  let state=(await request('/api/state')).body;assert.equal(state.contacts.length,405);assert.deepEqual(state.campaigns,history);
+  assert.deepEqual(state.contacts.map(c=>c.id),original.slice(1).map((_,i)=>`stored-${i}`));
+  assert.deepEqual(state.contacts.map(c=>c.business),original.slice(1).map(r=>r[0]));assert.deepEqual(state.contacts[0].excludedEmails,['p0@example.com']);
+  assert.equal(state.contacts[0].notes,'Keep notes');assert.deepEqual(state.contacts[0].phones,['+91 9999999999']);
+  assert.deepEqual(mock.sheets.get(sheetId).slice(1).map(r=>r[2]),original.slice(1).map(r=>r[0]));
+  const before=structuredClone(state.contacts);await finishImport(request,ws.id,{restart:true});state=(await request('/api/state')).body;assert.deepEqual(state.contacts,before);assert.deepEqual(state.campaigns,history);
+});
 
 test('an existing spreadsheet can be reused across workspaces without changing its source tab',async t=>{
   const mock=upstreamMock(),sheetId='existing-contacts-123';
@@ -85,7 +144,8 @@ test('an existing spreadsheet can be reused across workspaces without changing i
   const local=(await request('/api/contacts',{workspace:target.id,name:'Local',emails:['local@example.com']})).body;
   const linked=await request(`/api/workspaces/${target.id}/sheet`,{mode:'existing',sheetId:`  https://docs.google.com/spreadsheets/d/${sheetId}/edit?usp=sharing#gid=42  `});
   assert.equal(linked.status,200);assert.equal(linked.body.sheetId,sheetId);assert.equal(linked.body.sheetEmail,'sender@example.com');
-  assert.equal(linked.body.imported,3);assert.equal(linked.body.tabsScanned,3);
+  assert.equal(linked.body.needsContinuation,true);assert.ok(linked.body.jobId);
+  const imported=await finishImport(request,target.id);assert.equal(imported.imported,3);assert.equal(imported.tabsScanned,3);
   let state=(await request('/api/state')).body;
   assert.equal(state.contacts.length,4);assert.equal(state.uploads.length,0);assert.equal(mock.sheets.get(sheetId).length,5);
   const alice=state.contacts.find(c=>c.emails.includes('alice@example.com'));
@@ -93,12 +153,13 @@ test('an existing spreadsheet can be reused across workspaces without changing i
   const beta=state.contacts.find(c=>c.emails.includes('sales@beta.example'));
   assert.equal(beta.name,'');assert.equal(beta.business,'Beta Works');
   const nina=state.contacts.find(c=>c.emails.includes('hello@gamma-studio.com'));
-  assert.equal(nina.name,'Nina Shah');assert.equal(nina.business,'Gamma Studio');
+  assert.equal(nina.name,'');assert.equal(nina.business,'');assert.equal(imported.pending,1);assert.match(imported.error,/API key/);
   assert.deepEqual(mock.sourceTabs.get(sheetId),original);
   const rescanned=await request(`/api/workspaces/${target.id}/import-sheet`,{automatic:true});
-  assert.equal(rescanned.status,200);assert.equal(rescanned.body.imported,0);assert.equal((await request('/api/state')).body.contacts.length,4);
+  assert.equal(rescanned.status,200);assert.equal(rescanned.body.jobId,linked.body.jobId);assert.equal((await request('/api/state')).body.contacts.length,4);
   const reused=await request(`/api/workspaces/${other.id}/sheet`,{mode:'existing',sheetId});
-  assert.equal(reused.status,200);assert.equal(reused.body.sheetId,sheetId);assert.equal(reused.body.imported,0);
+  assert.equal(reused.status,200);assert.equal(reused.body.sheetId,sheetId);assert.equal(reused.body.jobId,linked.body.jobId);
+  await finishImport(request,other.id);
   state=(await request('/api/state')).body;
   assert.deepEqual(state.contacts.filter(c=>c.workspace===other.id).map(c=>c.id).sort(),state.contacts.filter(c=>c.workspace===target.id).map(c=>c.id).sort());
   await request('/api/contacts',{workspace:other.id,name:'Shared contact',emails:['shared@example.com']});

@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {randomUUID, randomBytes, createCipheriv, createDecipheriv} from 'node:crypto';
 import './core.js';
 import {createAuth} from './auth.mjs';
+import {createSheetImporter,SHEET_IMPORT_VERSION} from './sheet-import.mjs';
 
 const C = globalThis.GatherCore;
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -97,7 +98,7 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
   const inWorkspace = (list,wid) => list.filter(row => row.workspace === wid);
   const oauthReady = () => Boolean(env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET);
   const publicState = () => ({
-    ...db, pendingOAuth:undefined, limits:{imageMB:hosted?3:8,uploadBatch:hosted?1:2,maxCardUploads:C.cardUploadLimit,extractionBatchSize:C.cardBatchSize}, settings:{...db.settings, secret:undefined, hasKey:Boolean(db.settings.secret),extractionReady:extractionReady()},
+    ...db, pendingOAuth:undefined, sheetImportJobs:undefined, sheetImportVersion:SHEET_IMPORT_VERSION, limits:{imageMB:hosted?3:8,uploadBatch:hosted?1:2,maxCardUploads:C.cardUploadLimit,extractionBatchSize:C.cardBatchSize}, settings:{...db.settings, secret:undefined, hasKey:Boolean(db.settings.secret),extractionReady:extractionReady()},
     connections:Object.fromEntries(['gmail','sheets'].map(kind => [kind, db.connections[kind]
       ? {connected:!db.connections[kind].error,email:db.connections[kind].email,error:db.connections[kind].error || null}
       : {connected:false,email:null}])),
@@ -205,9 +206,9 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
     }
     fail('The provider model list is too large to load completely. Please try a narrower provider endpoint.',502);
   }
-  async function modelCall(prompt, asset) {
+  async function modelCall(prompt, asset, {spreadsheet=false}={}) {
     const settings=db.settings;
-    if (!settings.enabled || !settings.secret || !settings.model) fail('Enable card extraction, choose a model, and save your provider API key in Settings.',409);
+    if ((!spreadsheet&&!settings.enabled) || !settings.secret || !settings.model) fail(spreadsheet?'Choose a model and save its API key in Settings to resolve unclear spreadsheet names.':'Enable card extraction, choose a model, and save your provider API key in Settings.',409);
     const secret=decrypt(settings.secret);
     if (settings.provider === 'gemini') {
       const parts=[{text:prompt}];if(asset)parts.push({inlineData:{mimeType:asset.mime,data:(await readAsset(asset.id)).toString('base64')}});
@@ -219,8 +220,8 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
       if(asset)content.push({type:'image',source:{type:'base64',media_type:asset.mime,data:(await readAsset(asset.id)).toString('base64')}});
       content.push({type:'text',text:prompt});
       const result=await remote('https://api.anthropic.com/v1/messages',{method:'POST',redirect:'error',headers:{'content-type':'application/json','x-api-key':secret,'anthropic-version':'2023-06-01'},body:JSON.stringify({model:settings.model,max_tokens:4096,messages:[{role:'user',content}]})});
-      if(result.stop_reason==='max_tokens')fail('Claude reached its response limit. Try another Claude model or retry the card.',502);
-      if(result.stop_reason==='refusal')fail('Claude declined this request. Try another image or review the card manually.',502);
+      if(result.stop_reason==='max_tokens')fail('Claude reached its response limit. Try another Claude model in Settings.',502);
+      if(result.stop_reason==='refusal')fail('Claude declined this request. Try another model in Settings.',502);
       return result.content?.filter(block=>block.type==='text').map(block=>block.text||'').join('').trim() || fail('Claude returned no readable result.',502);
     }
     const url=new URL(settings.baseUrl);
@@ -250,89 +251,13 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
         await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${sid}:batchUpdate`,{method:'POST',body:JSON.stringify({requests:[{addSheet:{properties:{title:'Gather Contacts'}}}]})});
       }
     }
-    ws.sheetId=sheet.spreadsheetId;ws.sheetName=sheet.properties.title;ws.sheetEmail=db.connections.sheets.email;ws.syncError='';await persist();await autoSyncWorkspace(wid);
-    const imported=body.mode==='existing'?await autoImportSheet(wid,sheet.sheets):{imported:0,updated:0,tabsScanned:0};
+    ws.sheetId=sheet.spreadsheetId;ws.sheetName=sheet.properties.title;ws.sheetEmail=db.connections.sheets.email;ws.syncError='';await persist();
+    const imported=body.mode==='existing'?await sheetImporter.step(ws,{knownSheets:sheet.sheets}):(await autoSyncWorkspace(wid),{imported:0,updated:0,tabsScanned:0});
     return {...ws,...imported};
   }
   const sheetHeaders=['Gather ID','Contact name','Business','Role','Email addresses','Phone numbers','Notes','Excluded emails'];
   const sheetRow = c => [c.id,c.name,c.business,c.role,c.emails.join('; '),c.phones.join('; '),c.notes||'',(c.excludedEmails||[]).join('; ')];
-  const freeMailDomains=new Set(['gmail.com','googlemail.com','yahoo.com','yahoo.co.in','outlook.com','hotmail.com','live.com','icloud.com','me.com','aol.com','proton.me','protonmail.com','zoho.com','rediffmail.com']);
-  const companyWords=/\b(?:agency|associates|brand|company|consulting|corp(?:oration)?|digital|enterprises?|firm|foundation|group|hospital|hotel|inc(?:orporated)?|industries|institute|labs?|limited|llc|llp|ltd|pvt|school|solutions?|studio|technologies|university)\b/i;
-  const normalizedLabel=value=>String(value??'').trim().toLowerCase().replace(/[_/\\-]+/g,' ').replace(/[^\p{L}\p{N} ]/gu,'').replace(/\s+/g,' ');
-  function headerKind(value) {
-    const label=normalizedLabel(value);if(!label||label.length>45)return '';
-    if(/^(?:(?:work|contact|primary|business) )?e ?mail(?: id| address| addresses)?$/.test(label))return 'emails';
-    if(/^(?:business|business name|company|company name|organisation|organization|organisation name|organization name|firm|brand|studio|employer)$/.test(label))return 'business';
-    if(/^(?:name|full name|contact|contact name|contact person|person|person name|customer|customer name|client|client name|representative|attendee)$/.test(label))return 'name';
-    return '';
-  }
-  function emailsIn(value) {
-    const found=String(value??'').match(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+/gi)||[];
-    return [...new Set(found.map(C.email).filter(C.validEmail))];
-  }
-  const readableText=value=>{
-    const text=String(value??'').trim();
-    return text&&text.length<=160&&!emailsIn(text).length&&!headerKind(text)&&!/^https?:\/\//i.test(text)&&!/^[-+()\d\s./:]+$/.test(text)?text:'';
-  };
-  function headerMap(rows,rowIndex) {
-    for(let index=rowIndex-1;index>=Math.max(0,rowIndex-30);index--) {
-      const map={};for(let column=0;column<rows[index].length;column++){const kind=headerKind(rows[index][column]);if(kind&&!Object.hasOwn(map,kind))map[kind]=column;}
-      if(Object.keys(map).length>=2||map.emails)return map;
-      if(index<rowIndex-1&&rows[index].some(value=>emailsIn(value).length))break;
-    }
-    return {};
-  }
-  function labelledValue(rows,rowIndex,kind) {
-    for(let index=rowIndex;index>=Math.max(0,rowIndex-6);index--) {
-      const row=rows[index];if(index<rowIndex&&!row.some(value=>String(value??'').trim()))break;
-      for(let column=0;column<row.length;column++)if(headerKind(row[column])===kind) {
-        for(const value of [row[column+1],index<rowIndex?rows[index+1]?.[column]:undefined]) {
-          const text=readableText(value);if(text)return text;
-        }
-      }
-    }
-    return '';
-  }
-  function businessFromEmail(email) {
-    const domain=email.split('@')[1]||'';if(!domain||freeMailDomains.has(domain))return '';
-    const labels=domain.split('.').filter(label=>!['www','mail','email','contact','com','co','org','net','edu','ac','gov','in','uk'].includes(label));
-    const label=labels.at(-1)||'';return label.replace(/[-_]+/g,' ').replace(/\b\w/g,letter=>letter.toUpperCase());
-  }
-  function inferredContact(rows,rowIndex) {
-    const row=rows[rowIndex]||[],emails=[...new Set(row.flatMap(emailsIn))];if(!emails.length)return null;
-    const map=headerMap(rows,rowIndex);
-    let name=readableText(row[map.name])||labelledValue(rows,rowIndex,'name');
-    let business=readableText(row[map.business])||labelledValue(rows,rowIndex,'business');
-    const candidates=row.map(readableText).filter(Boolean).filter(value=>value!==name&&value!==business);
-    const domainKey=(emails[0].split('@')[1]||'').split('.').filter(part=>!['com','co','org','net','edu','ac','gov','in','uk'].includes(part)).at(-1)?.replace(/[^a-z0-9]/gi,'').toLowerCase()||'';
-    const businessScore=value=>(companyWords.test(value)?4:0)+(domainKey&&normalizedLabel(value).replace(/[^a-z0-9]/g,'').includes(domainKey)?5:0);
-    const personScore=value=>{const words=value.split(/\s+/).filter(Boolean);return !companyWords.test(value)&&words.length>=2&&words.length<=5&&words.every(word=>/^[\p{L}.'-]+$/u.test(word))?3:0;};
-    if(!business&&candidates.length){const ranked=[...candidates].sort((a,b)=>businessScore(b)-businessScore(a));if(businessScore(ranked[0])>0||candidates.length===1&&personScore(candidates[0])===0)business=ranked[0];}
-    if(!name){const choices=candidates.filter(value=>value!==business).sort((a,b)=>personScore(b)-personScore(a));if(choices.length&&(personScore(choices[0])>0||candidates.length>1))name=choices[0];}
-    if(!business){const remaining=candidates.find(value=>value!==name);business=remaining||businessFromEmail(emails[0]);}
-    return C.contact({name,business,emails});
-  }
-  async function autoImportSheet(wid,knownSheets) {
-    const ws=workspace(wid);if(!ws.sheetId)fail('Connect a spreadsheet first.');
-    if(db.connections.sheets?.email!==ws.sheetEmail)fail('Reconnect the Google Sheets account that owns this workspace.',409);
-    const metadata=knownSheets?{sheets:knownSheets}:await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${ws.sheetId}?fields=sheets.properties`);
-    const titles=(metadata.sheets||[]).map(sheet=>sheet.properties||{}).filter(properties=>properties.title&&properties.title!=='Gather Contacts'&&(!properties.sheetType||properties.sheetType==='GRID')).map(properties=>properties.title);
-    let imported=0,updated=0,tabsScanned=0;const skippedTabs=[];
-    for(const title of titles) {
-      const tab=title.replaceAll("'","''");let rows;
-      try{rows=(await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${ws.sheetId}/values/${encodeURIComponent(`'${tab}'!A1:ZZ10000`)}`)).values||[];tabsScanned++;}
-      catch{skippedTabs.push(title);continue;}
-      for(let index=0;index<rows.length;index++) {
-        const candidate=inferredContact(rows,index);if(!candidate)continue;
-        const matches=inWorkspace(db.contacts,wid).filter(contact=>contact.emails.some(email=>candidate.emails.includes(email)));
-        if(matches.length) {
-          const current=matches[0],before=JSON.stringify(C.contact(current)),merged=C.merge(current,candidate);
-          if(JSON.stringify(C.contact(merged))!==before){Object.assign(current,merged,{dirty:true});updated++;}
-        } else {db.contacts.push({...candidate,id:id(),workspace:wid,dirty:true});imported++;}
-      }
-    }
-    await persist();await autoSyncWorkspace(wid);return {imported,updated,tabsScanned,skippedTabs};
-  }
+  const sheetImporter=createSheetImporter({db,google,persist,modelCall,syncSheet});
   async function readSheet(wid) {
     const ws=workspace(wid);if(!ws.sheetId)fail('Connect this workspace to a spreadsheet first.',409);
     if(db.connections.sheets?.email!==ws.sheetEmail)fail('Reconnect the Google Sheets account that owns this workspace.',409);
@@ -340,32 +265,39 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
     const result=await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${ws.sheetId}/values/${range}`);
     return result.values || [];
   }
-  async function syncSheet(wid) {
+  async function syncSheet(wid,{importJob=false,limit=Infinity}={}) {
     const ws=workspace(wid);
     try {
+      if(!importJob&&['scan','repair'].includes(sheetImporter.existing(ws)?.phase))fail('Spreadsheet repair is still reading source data. Keep Gather open; syncing will continue automatically.',409);
       const rows=await readSheet(wid);
       if(rows.length && rows[0].join('|')!==sheetHeaders.join('|'))fail('The Gather Contacts tab needs the expected columns. Use the original contacts tab to import existing rows.');
-      const updates=[],remoteIds=new Set();let imported=0;
+      const updates=[],remoteIds=new Set(),saved=new Set();let imported=0,pending=0;
+      const workspaceContacts=inWorkspace(db.contacts,wid);
       for(let index=1;index<rows.length;index++) {
         const row=rows[index];if(!row.some(Boolean))continue;
-        const rid=row[0]||id();if(remoteIds.has(rid))fail('Duplicate Gather IDs exist in the spreadsheet. Correct them before syncing.');remoteIds.add(rid);
         const parsed=C.contact({name:row[1],business:row[2],role:row[3],emails:row[4],phones:row[5],notes:row[6],excludedEmails:row[7]});
-        const local=db.contacts.find(c=>c.id===rid && c.workspace===wid);
-        if(local?.dirty) {updates.push({range:`'Gather Contacts'!A${index+1}:H${index+1}`,values:[sheetRow(local)]});}
+        parsed.name=String(row[1]??'');parsed.business=String(row[2]??'');
+        const matches=row[0]||!importJob?[]:workspaceContacts.filter(c=>c.emails.some(email=>parsed.emails.includes(email)));
+        if(matches.length>1)fail('A Gather Contacts row without an ID matches several contacts. Restore its original Gather ID to finish syncing.',409);
+        const rid=row[0]||(matches.length===1?matches[0].id:id());if(remoteIds.has(rid))fail('Duplicate Gather IDs exist in the spreadsheet. Correct them before syncing.');remoteIds.add(rid);
+        let local=db.contacts.find(c=>c.id===rid && c.workspace===wid);
+        if(local?.dirty) {if(saved.size<limit){updates.push({range:`'Gather Contacts'!A${index+1}:H${index+1}`,values:[sheetRow(local)]});saved.add(local);}else pending++;}
         else if(local)Object.assign(local,parsed);
-        else {db.contacts.push({...parsed,id:rid,workspace:wid,dirty:false});imported++;}
-        if(!row[0])updates.push({range:`'Gather Contacts'!A${index+1}`,values:[[rid]]});
+        else {local={...parsed,id:rid,workspace:wid,dirty:false};db.contacts.push(local);imported++;}
+        if(!row[0]&&!saved.has(local)){
+          if(saved.size<limit){updates.push({range:`'Gather Contacts'!A${index+1}`,values:[[rid]]});saved.add(local);}
+          else {if(!local.dirty)pending++;local.dirty=true;}
+        }
       }
       if(!rows.length)updates.push({range:"'Gather Contacts'!A1:H1",values:[sheetHeaders]});
       if(updates.length)await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${ws.sheetId}/values:batchUpdate`,{method:'POST',body:JSON.stringify({valueInputOption:'RAW',data:updates})});
-      const newRows=inWorkspace(db.contacts,wid).filter(c=>!remoteIds.has(c.id));
+      const missing=inWorkspace(db.contacts,wid).filter(c=>!remoteIds.has(c.id)),newRows=missing.slice(0,Math.max(0,limit-saved.size));pending+=missing.length-newRows.length;
       if(newRows.length)await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${ws.sheetId}/values/${encodeURIComponent("'Gather Contacts'!A:H")}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,{method:'POST',body:JSON.stringify({values:newRows.map(sheetRow)})});
-      inWorkspace(db.contacts,wid).forEach(c=>c.dirty=false);ws.syncedAt=now();ws.syncError='';await persist();return {imported,appended:newRows.length};
+      for(const c of [...saved,...newRows])c.dirty=false;ws.syncedAt=now();ws.syncError='';await persist();return {imported,appended:newRows.length,...(importJob?{pending}:{})};
     } catch(error) {ws.syncError=error.message;await persist();throw error;}
   }
   function saveContact(wid,raw,existingId) {
     workspace(wid);const parsed=C.contact(raw);
-    if(!parsed.business && !parsed.name)fail('Enter a business or contact name.');
     if(!parsed.emails.length && !parsed.phones.length)fail('Enter at least one email address or phone number.');
     let row=existingId ? db.contacts.find(c=>c.id===existingId && c.workspace===wid) : null;
     if(existingId && !row)fail('Contact not found.',404);
@@ -465,9 +397,13 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
       if(String(body.apiKey||'').trim())db.settings.secret=encrypt(String(body.apiKey).trim());
       if(body.clearKey)db.settings.secret='';
       for(const upload of db.uploads)if(['queued','needs_setup'].includes(upload.extractionState)&&upload.status==='uploaded')upload.extractionState=extractionReady()?'queued':'needs_setup';
+      for(const job of db.sheetImportJobs)if(job.phase==='ai'&&job.status==='waiting'){
+        job.status='running';job.retryAt=null;job.failures=0;job.error='';
+        for(const w of db.workspaces)if(w.sheetId===job.sheetId&&w.sheetEmail===job.sheetEmail)w.sheetImport=sheetImporter.summary(job);
+      }
       await persist();return respond({ok:true});
     }
-    if(path==='/api/settings/test' && method==='POST'){await modelCall('Return only JSON: {"ok":true}');return respond({ok:true});}
+    if(path==='/api/settings/test' && method==='POST'){await modelCall('Return only JSON: {"ok":true}',undefined,{spreadsheet:true});return respond({ok:true});}
     if(path==='/api/connect/google' && method==='POST') {
       if(!oauthReady())fail('Google sign-in needs the application OAuth client configured on the server. See the setup details below.',409);
       if(!['gmail','sheets'].includes(body.kind))fail('Unknown connection.');
@@ -501,7 +437,7 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
       const [ ,wid,action]=match;
       if(action==='sheet')return respond(await bindSheet(wid,body));
       if(action==='sync')return respond(await syncSheet(wid));
-      if(body.automatic===true)return respond(await autoImportSheet(wid));
+      if(body.automatic===true)return respond(await sheetImporter.step(workspace(wid),{jobId:body.jobId,restart:body.restart===true}));
       const ws=workspace(wid);if(!ws.sheetId)fail('Connect a spreadsheet first.');
       if(db.connections.sheets?.email!==ws.sheetEmail)fail('Reconnect the Google Sheets account that owns this workspace.',409);
       const tab=required(body.tab,'Tab name').replaceAll("'","''");

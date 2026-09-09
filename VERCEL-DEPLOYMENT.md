@@ -7,11 +7,11 @@ Project: `gather-crm` (`prj_NzkpJq0CKXpyObPJJh1wxDfClREj`).
 
 Production: https://gather-crm.vercel.app
 
-Deployment: `dpl_4TDMcZZFNhT6TE34wmrFr13znWAY` (Ready). App source: GitHub commit `24aa1b019d65f0cd98fe7f29cf712e05d2b66ece` on `main`. Published using the validated prebuilt function bundle.
+Source: the `main` branch of [GMAIL-AUTOMATION](https://github.com/rc2308/GMAIL-AUTOMATION). Published using the validated prebuilt function bundle and the existing Vercel project.
 
-This release includes Anthropic Claude keys and model selection, spreadsheet linking/import improvements, automatic email batches of up to 100, and 40-card selections processed in groups of 10 with one failed-read retry and saved-image cleanup. Card processing and email progression require the app tab to remain open.
+This release replaces spreadsheet name guessing with persistent column mappings, exact source values, and validated AI assistance for unclear layouts. Existing linked spreadsheets begin automatic repair when the signed-in user opens Gather. Jobs continue while the app is open and resume on return, without preview or approval screens. Grid dimensions replace the fixed row/column cutoff. Shared workspaces retain contact IDs, exclusions, notes, phones, and campaign snapshots. API keys and model choices also work for spreadsheet assistance when card extraction is disabled.
 
-Release validation passed: 88 automated tests, syntax checks, and the production build. Live checks confirmed login and public pages return 200, all four frontend code/style files match the release exactly, the database-backed session endpoint responds successfully, private API/image access requires authentication, and private server/environment paths return 404. Local browser checks used mocked providers and temporary images; this deployment verification did not send real emails or request real AI extraction.
+Release validation: 105 automated tests, syntax checks, and the production build. A local headless browser verified all 13 screenshot business names, 26 contacts across two shared workspaces, automatic repair, rescan/reload recovery, the correct workspace's edit form, and preserved delivery history. Provider tests cover Claude, Gemini, and compatible APIs, source validation, transient and permanent failures, missing keys, encrypted credentials, and account isolation. No real emails or AI requests were made during these checks.
 
 ## Earlier deployment — 9 September 2026
 

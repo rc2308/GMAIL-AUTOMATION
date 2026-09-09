@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env server.mjs",
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check app.js && node --check core.js && node --check model-picker.js && node --check server.mjs && node --check auth.mjs && node --check auth.js && node --check api/index.mjs && node --check cloud/postgres.mjs",
+    "check": "node --check app.js && node --check core.js && node --check model-picker.js && node --check server.mjs && node --check sheet-import.mjs && node --check auth.mjs && node --check auth.js && node --check api/index.mjs && node --check cloud/postgres.mjs",
     "build": "node scripts/build-vercel.mjs"
   },
   "engines": {
