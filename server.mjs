@@ -245,7 +245,6 @@ function createAccountApp({dataDir,env,fetchImpl,onPersist,getAsset,onDelete,aut
         sid=url.pathname.match(/^\/spreadsheets\/(?:u\/\d+\/)?d\/([a-zA-Z0-9_-]+)(?:\/|$)/)?.[1]||'';
       }
       if (!/^[a-zA-Z0-9_-]{10,}$/.test(sid)) fail('Enter a valid Google spreadsheet URL or ID.');
-      if(db.workspaces.some(w=>w.sheetId===sid))fail('That spreadsheet already belongs to another workspace.');
       sheet=await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${sid}?fields=spreadsheetId,properties.title,sheets.properties`);
       if(!sheet.sheets?.some(s=>s.properties.title==='Gather Contacts')) {
         await google('sheets',`https://sheets.googleapis.com/v4/spreadsheets/${sid}:batchUpdate`,{method:'POST',body:JSON.stringify({requests:[{addSheet:{properties:{title:'Gather Contacts'}}}]})});

@@ -71,7 +71,7 @@ async function connect(request,kind){
   const callback=await request(`/api/oauth/google/callback?state=${state}&code=${kind}`,undefined,{headers:{cookie}});assert.equal(callback.status,303);
 }
 
-test('linking an existing spreadsheet imports mapped contacts into its workspace without changing the source tab',async t=>{
+test('an existing spreadsheet can be reused across workspaces without changing its source tab',async t=>{
   const mock=upstreamMock(),sheetId='existing-contacts-123';
   const original=[['Full name','Company','Work emails','Mobile','Notes'],['Alice','Acme','alice@example.com; sales@example.com','+91 9000012345','Source note'],['Bob','Beta','','+91 9000098765',''],['No details','','','','']];
   mock.sourceTabs.set(sheetId,new Map([["Team's contacts",structuredClone(original)]]));
@@ -93,10 +93,16 @@ test('linking an existing spreadsheet imports mapped contacts into its workspace
   const approved=await request(`/api/uploads/${state.uploads[0].id}/review`,{action:'save',contact:state.uploads[0].fields});
   assert.equal(approved.status,200);assert.equal(mock.sheets.get(sheetId).length,3);
   assert.deepEqual(mock.sourceTabs.get(sheetId).get("Team's contacts"),original);
-  assert.equal((await request(`/api/workspaces/${other.id}/sheet`,{mode:'existing',sheetId})).status,400);
+  const reused=await request(`/api/workspaces/${other.id}/sheet`,{mode:'existing',sheetId});
+  assert.equal(reused.status,200);assert.equal(reused.body.sheetId,sheetId);
+  state=(await request('/api/state')).body;
+  assert.deepEqual(state.contacts.filter(c=>c.workspace===other.id).map(c=>c.id).sort(),state.contacts.filter(c=>c.workspace===target.id).map(c=>c.id).sort());
+  await request('/api/contacts',{workspace:other.id,name:'Shared contact',emails:['shared@example.com']});
+  assert.equal((await request(`/api/workspaces/${target.id}/sync`,{})).status,200);
   const restarted=createGather({dataDir});state=restarted.publicState();restarted.server.close();
-  assert.equal(state.workspaces.find(w=>w.id===target.id).sheetId,sheetId);assert.equal(state.workspaces.find(w=>w.id===other.id).sheetId,null);
-  assert.equal(state.contacts.filter(c=>c.workspace===other.id).length,0);
+  assert.equal(state.workspaces.find(w=>w.id===target.id).sheetId,sheetId);assert.equal(state.workspaces.find(w=>w.id===other.id).sheetId,sheetId);
+  assert.ok(state.contacts.some(c=>c.workspace===target.id&&c.emails.includes('shared@example.com')));
+  assert.ok(state.contacts.some(c=>c.workspace===other.id&&c.emails.includes('shared@example.com')));
 });
 
 test('bad sheet links and denied Google access leave the workspace available for a corrected link',async t=>{
