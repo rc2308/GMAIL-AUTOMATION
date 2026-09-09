@@ -3,7 +3,17 @@
 Target team: `rounakchhatait-5235s-projects`.
 Project: `gather-crm` (`prj_NzkpJq0CKXpyObPJJh1wxDfClREj`).
 
-## Live deployment — 9 September 2026
+## Latest production release — 9 September 2026
+
+Production: https://gather-crm.vercel.app
+
+Deployment: `dpl_4TDMcZZFNhT6TE34wmrFr13znWAY` (Ready). App source: GitHub commit `24aa1b019d65f0cd98fe7f29cf712e05d2b66ece` on `main`. Published using the validated prebuilt function bundle.
+
+This release includes Anthropic Claude keys and model selection, spreadsheet linking/import improvements, automatic email batches of up to 100, and 40-card selections processed in groups of 10 with one failed-read retry and saved-image cleanup. Card processing and email progression require the app tab to remain open.
+
+Release validation passed: 88 automated tests, syntax checks, and the production build. Live checks confirmed login and public pages return 200, all four frontend code/style files match the release exactly, the database-backed session endpoint responds successfully, private API/image access requires authentication, and private server/environment paths return 404. Local browser checks used mocked providers and temporary images; this deployment verification did not send real emails or request real AI extraction.
+
+## Earlier deployment — 9 September 2026
 
 Production: https://gather-crm.vercel.app
 
